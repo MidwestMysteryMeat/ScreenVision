@@ -190,3 +190,9 @@ scrubbed it for release, and added the review notes above.
 
 Proprietary — see [LICENSE](LICENSE). Licensed under the **Ephemeral / Proprietary License** (All Rights Reserved with a Sharing Exception). Provided "AS IS", without warranty; use is at your
 own risk and responsibility (see "Responsibility & liability" above).
+
+---
+
+<sub>Support development — <a href="https://ko-fi.com/midwestmysterymeat">Ko-fi</a></sub>
+
+<img src=".github/donation-qrcode.png" width="120" alt="Donation QR code">
