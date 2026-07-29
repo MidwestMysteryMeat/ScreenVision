@@ -1,3 +1,5 @@
+import ast
+import operator
 import gradio as gr
 import urllib.request, urllib.parse, base64, json, io, threading, time, hashlib, os, sys
 from PIL import Image
@@ -55,7 +57,7 @@ _MONITOR = "left"
 
 
 def _snap_url():
-    params = urllib.parse.urlencode({"screen": _MONITOR, "token": TOKEN})
+    params = urllib.parse.urlencode({"screen": _MONITOR})
     sep = "&" if "?" in SNAP_URL else "?"
     return f"{SNAP_URL}{sep}{params}"
 
@@ -122,7 +124,12 @@ _auto_prev_running = False   # for the UI poll to detect a self-stop
 
 
 def _fetch_and_encode():
-    with urllib.request.urlopen(_snap_url(), timeout=10) as r:
+    req = urllib.request.Request(
+        _snap_url(),
+        headers={"X-Auth-Token": TOKEN},
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
         data = r.read()
     img = Image.open(io.BytesIO(data)).convert("RGB")
     if img.width > MAX_WIDTH:
@@ -222,14 +229,77 @@ _GRAPH_NS = None   # lazy numpy namespace for safe expression eval
 
 def _safe_expr_eval(expr, x):
     import numpy as np
+
+    if not isinstance(expr, str) or not expr.strip():
+        raise ValueError("graph expression is empty")
+    if len(expr) > 500:
+        raise ValueError("graph expression is too long")
+
     global _GRAPH_NS
     if _GRAPH_NS is None:
         _GRAPH_NS = {k: getattr(np, k) for k in (
             "sin", "cos", "tan", "arcsin", "arccos", "arctan", "sinh", "cosh",
             "tanh", "sqrt", "cbrt", "exp", "log", "log10", "log2", "abs",
             "sign", "floor", "ceil", "pi", "e", "maximum", "minimum", "power")}
-    expr = expr.replace("^", "**")
-    return eval(expr, {"__builtins__": {}}, {**_GRAPH_NS, "x": x})
+
+    try:
+        tree = ast.parse(expr.replace("^", "**"), mode="eval")
+    except SyntaxError as exc:
+        raise ValueError("invalid graph expression") from exc
+
+    if sum(1 for _ in ast.walk(tree)) > 100:
+        raise ValueError("graph expression is too complex")
+
+    binary_ops = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+        ast.FloorDiv: operator.floordiv,
+        ast.Mod: operator.mod,
+        ast.Pow: operator.pow,
+    }
+    unary_ops = {
+        ast.UAdd: operator.pos,
+        ast.USub: operator.neg,
+    }
+
+    def evaluate(node, depth=0):
+        if depth > 25:
+            raise ValueError("graph expression is too deeply nested")
+        if isinstance(node, ast.Expression):
+            return evaluate(node.body, depth + 1)
+        if isinstance(node, ast.Constant):
+            if type(node.value) not in (int, float):
+                raise ValueError("only numeric constants are allowed")
+            if abs(node.value) > 1e12:
+                raise ValueError("numeric constant is too large")
+            return node.value
+        if isinstance(node, ast.Name):
+            if node.id == "x":
+                return x
+            value = _GRAPH_NS.get(node.id)
+            if node.id in ("pi", "e"):
+                return value
+            raise ValueError(f"unknown graph name: {node.id}")
+        if isinstance(node, ast.UnaryOp) and type(node.op) in unary_ops:
+            return unary_ops[type(node.op)](evaluate(node.operand, depth + 1))
+        if isinstance(node, ast.BinOp) and type(node.op) in binary_ops:
+            left = evaluate(node.left, depth + 1)
+            right = evaluate(node.right, depth + 1)
+            if isinstance(node.op, ast.Pow) and np.isscalar(right) and abs(float(right)) > 100:
+                raise ValueError("graph exponent is too large")
+            return binary_ops[type(node.op)](left, right)
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name) or node.func.id not in _GRAPH_NS:
+                raise ValueError("only approved graph functions are allowed")
+            function = _GRAPH_NS[node.func.id]
+            if not callable(function) or node.keywords or len(node.args) > 4:
+                raise ValueError("invalid graph function call")
+            return function(*(evaluate(arg, depth + 1) for arg in node.args))
+        raise ValueError(f"unsupported graph syntax: {type(node).__name__}")
+
+    return evaluate(tree)
 
 
 def _parse_graph_spec(text):
@@ -514,7 +584,7 @@ CSS = """
 }
 """
 
-with gr.Blocks(title="Screen Vision", css=CSS) as demo:
+with gr.Blocks(title="Screen Vision") as demo:
     gr.Markdown(f"## Screen Vision — {MODEL}")
 
     with gr.Row():
@@ -595,5 +665,10 @@ if UI_BIND == "0.0.0.0" and not UI_AUTH:
     print("[screen_vision] WARNING: UI bound to 0.0.0.0 (LAN-reachable) with no login. "
           "Set SCREENVISION_UI_USER / SCREENVISION_UI_PASS to require one.", flush=True)
 
-demo.launch(server_name=UI_BIND, server_port=7862, inbrowser=True,
-            show_error=True, auth=UI_AUTH)
+def main():
+    demo.launch(server_name=UI_BIND, server_port=7862, inbrowser=True,
+                show_error=True, auth=UI_AUTH, css=CSS)
+
+
+if __name__ == "__main__":
+    main()

@@ -10,7 +10,8 @@ Run on the target PC:
     pythonw snap_server.py          # background, no console window
     python  snap_server.py          # foreground, logs to console
 
-ScreenVision (on the GPU host) fetches http://<this-pc-ip>:8765/snap?token=...
+ScreenVision (on the GPU host) fetches http://<this-pc-ip>:8765/snap and sends
+the shared secret in the X-Auth-Token request header.
 
 REQUIRED before it will start (this is deliberate — it makes running the tool an
 affirmative, on-the-record choice by you, the operator):
@@ -22,7 +23,7 @@ affirmative, on-the-record choice by you, the operator):
 Stop it by killing the process (Task Manager, or Stop-Process on the printed PID).
 
 Which monitor is returned:
-  - default: DEFAULT_MONITOR below ("right")
+  - default: DEFAULT_MONITOR below ("left")
   - override per request: /snap?screen=left , ?screen=right , ?screen=primary,
     ?screen=all , or a raw mss index (?screen=1 = first physical monitor).
 """
@@ -34,7 +35,7 @@ import time
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
-from PIL import Image, ImageGrab
+from PIL import Image
 
 # Transparency state: when was the screen last served, and how many times.
 # The tray indicator (if available) turns red while capture is recent.
@@ -129,18 +130,19 @@ def _pick_monitor(sct, target):
             return mons[idx]
     except ValueError:
         pass
-    return mons[0]
+    raise ValueError(
+        f"invalid monitor selector {target!r}; use left, right, primary, all, "
+        f"or an index from 0 to {len(mons) - 1}"
+    )
 
 
 def _grab_jpeg(target) -> bytes:
-    try:
-        with _mss() as sct:
-            mon = _pick_monitor(sct, target)
-            shot = sct.grab(mon)
-            img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
-    except Exception:
-        # mss unavailable → fall back to the full virtual desktop
-        img = ImageGrab.grab(all_screens=True)
+    # Fail closed if mss cannot capture the requested monitor. Falling back to a
+    # full-desktop grab would silently expose more screens than were requested.
+    with _mss() as sct:
+        mon = _pick_monitor(sct, target)
+        shot = sct.grab(mon)
+        img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="JPEG", quality=JPEG_QUALITY)
     return buf.getvalue()
@@ -163,8 +165,15 @@ class Handler(BaseHTTPRequestHandler):
                 q = parse_qs(urlparse(self.path).query)
                 target = q.get("screen", [DEFAULT_MONITOR])[0]
                 data = _grab_jpeg(target)
+            except ValueError as e:
+                self.send_response(400)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(str(e).encode())
+                return
             except Exception as e:
                 self.send_response(503)
+                self.send_header("Content-Type", "text/plain")
                 self.end_headers()
                 self.wfile.write(str(e).encode())
                 return

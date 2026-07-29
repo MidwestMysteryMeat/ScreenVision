@@ -84,7 +84,7 @@ provided **"AS IS", with no warranty and no author liability** (see
 ```
 Target PC (the screen you want analyzed)          Server (GPU host, e.g. R720)
 ┌─────────────────────────────┐                   ┌──────────────────────────┐
-│ snap_server.py               │ GET /snap?token=… │ screen_vision.py         │
+│ snap_server.py               │ GET /snap + auth  │ screen_vision.py         │
 │  serves a JPEG of the screen │◄──────────────────│  Gradio UI (localhost)   │
 │  token-gated on :8765        │                   │  + Ollama vision model   │
 └─────────────────────────────┘                   └──────────────────────────┘
