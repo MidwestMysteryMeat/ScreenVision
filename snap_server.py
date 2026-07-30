@@ -106,7 +106,8 @@ DEFAULT_MONITOR = "left"
 
 def _mss():
     import mss as _m
-    cls = getattr(_m, "MSS", None) or getattr(_m, "mss")
+    # mss exposes the class as `MSS` on some versions and `mss` on others.
+    cls = getattr(_m, "MSS", None) or _m.mss
     return cls()
 
 

@@ -1,0 +1,35 @@
+# Static analysis config for ScreenVision.
+#
+#   ruff check .        -- must exit clean; run before every commit
+#
+# Correctness rules only, no formatting. This project predates any formatter and
+# reflowing it would bury the signal in noise.
+
+target-version = "py39"
+line-length = 120
+
+exclude = [".venv", "venv", "build", "dist", "__pycache__"]
+
+[lint]
+# Each of these can catch code that raises or silently misbehaves at runtime.
+select = [
+    "F",      # pyflakes: undefined names (F821), redefinitions (F811),
+              #           `is` on a literal (F632), unused imports, f-string bugs
+    "E4",     # import placement
+    "E7",     # comparison mistakes: `== None` (E711), `== True` (E712),
+              #                      bare except-ish patterns, lambda assignment
+    "E9",     # syntax and IO errors
+    "B",      # bugbear: mutable default args (B006), function call in default
+              #          (B008), loop-variable capture, unreachable except
+    "A",      # shadowing a builtin
+    "RUF",    # ruff-specific correctness checks
+]
+
+ignore = [
+    "B008",   # function-call-in-default is idiomatic in some CLI/arg helpers here
+    "RUF012", # ClassVar annotation on mutable class attrs - stylistic
+]
+
+[lint.per-file-ignores]
+# Tests may shadow builtins and re-import for fixtures.
+"tests/*" = ["A", "F811"]

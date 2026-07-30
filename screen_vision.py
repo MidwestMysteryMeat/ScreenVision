@@ -1,7 +1,16 @@
 import ast
 import operator
 import gradio as gr
-import urllib.request, urllib.parse, base64, json, io, threading, time, hashlib, os, sys
+import base64
+import hashlib
+import io
+import json
+import os
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
 from PIL import Image
 
 SNAP_URL = "http://TARGET_PC_IP:8765/snap"   # set to the target PC's LAN IP running snap_server.py
@@ -399,7 +408,10 @@ def _parabola_expr_from_points(points_str):
         denom = (vx - r1) * (vx - r2)
         if abs(denom) > 1e-9:
             a = vy / denom
-            fac = lambda r: "x" if abs(r) < 1e-9 else (f"(x-{r:g})" if r > 0 else f"(x+{-r:g})")
+            def fac(r):
+                if abs(r) < 1e-9:
+                    return "x"
+                return f"(x-{r:g})" if r > 0 else f"(x+{-r:g})"
             coef = "" if abs(a - 1) < 1e-9 else ("-" if abs(a + 1) < 1e-9 else f"{a:g}*")
             return f"{coef}{fac(r1)}*{fac(r2)}"
     return None

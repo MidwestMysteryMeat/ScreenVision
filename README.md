@@ -197,3 +197,13 @@ Provided "AS IS", without warranty of any kind (Apache-2.0 §7–8); use is at y
 ---
 
 <sub>Support development — <a href="https://ko-fi.com/midwestmysterymeat">Ko-fi</a></sub>
+
+## Checks
+
+```
+python -m unittest discover -s tests    # 5 tests
+ruff check .                            # static analysis; must be clean
+```
+
+`ruff.toml` selects correctness rules only (pyflakes, bugbear, builtin
+shadowing) — no formatting rules.
