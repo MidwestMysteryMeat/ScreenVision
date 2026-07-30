@@ -1,5 +1,11 @@
 # ScreenVision
 
+
+<!-- wip-contact-banner -->
+> **Work in progress.** This is an active side project alongside my main game development, so progress is intermittent — expect bugs, missing features, and rough edges.
+>
+> Bug reports, feedback, or contributions are welcome via GitHub issues/PRs, or email **midwestmysterymeatstudios@gmail.com**. If you'd like to support the work, tips are appreciated but never expected.
+
 A standalone, self-hosted screen-analysis tool. A vision LLM (served locally
 via Ollama) looks at a screenshot and either answers what's on screen (Exam
 mode) or produces a structured activity report (Business mode). Runs entirely
