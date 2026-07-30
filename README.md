@@ -102,6 +102,12 @@ Two moving parts, two machines:
 
 ## Setup
 
+Install the runtime packages on each machine (it is fine to use the same full
+set on both):
+```
+python -m pip install -r requirements.txt
+```
+
 Pick one shared secret and use it on both machines:
 ```
 python -c "import secrets; print(secrets.token_urlsafe(24))"
@@ -202,8 +208,9 @@ Provided "AS IS", without warranty of any kind (Apache-2.0 §7–8); use is at y
 
 ```
 python -m unittest discover -s tests    # 5 tests
-ruff check .                            # static analysis; must be clean
+python -m ruff check .                  # static analysis; must be clean
 ```
 
 `ruff.toml` selects correctness rules only (pyflakes, bugbear, builtin
-shadowing) — no formatting rules.
+shadowing) — no formatting rules. Install the reproducible development toolchain
+with `python -m pip install -r requirements-dev.txt`; Ruff is pinned there.

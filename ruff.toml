@@ -1,6 +1,6 @@
 # Static analysis config for ScreenVision.
 #
-#   ruff check .        -- must exit clean; run before every commit
+#   python -m ruff check .  -- must exit clean; run before every commit
 #
 # Correctness rules only, no formatting. This project predates any formatter and
 # reflowing it would bury the signal in noise.
