@@ -188,8 +188,11 @@ scrubbed it for release, and added the review notes above.
 
 ## License
 
-Proprietary — see [LICENSE](LICENSE). Licensed under the **Ephemeral / Proprietary License** (All Rights Reserved with a Sharing Exception). Provided "AS IS", without warranty; use is at your
-own risk and responsibility (see "Responsibility & liability" above).
+Licensed under the **[Apache License 2.0](LICENSE)** — free to use, modify, fork and build on, commercially or not.
+
+**Credit is required.** Apache-2.0 §4(c)–(d) obliges you to keep the copyright notice and to reproduce [`NOTICE`](NOTICE) in anything you distribute, including binaries and hosted builds. Credit it as `ScreenVision by MysteryMeat` (https://github.com/MidwestMysteryMeat/ScreenVision) in your credits screen, About box, or docs. The project name and the MysteryMeat name are not licensed for endorsement or promotion (§6).
+
+Provided "AS IS", without warranty of any kind (Apache-2.0 §7–8); use is at your own risk and responsibility (see "Responsibility & liability" above).
 
 ---
 
