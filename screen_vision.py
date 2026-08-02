@@ -4,7 +4,9 @@ import gradio as gr
 import urllib.request, urllib.parse, base64, json, io, threading, time, hashlib, os, sys
 from PIL import Image
 
-SNAP_URL = "http://TARGET_PC_IP:8765/snap"   # set to the target PC's LAN IP running snap_server.py
+# Target PC running snap_server.py. Set SCREENVISION_SNAP_URL to its LAN address,
+# e.g. http://192.168.1.50:8765/snap
+SNAP_URL = os.environ.get("SCREENVISION_SNAP_URL", "http://TARGET_PC_IP:8765/snap")
 OLLAMA = "http://localhost:11434"
 MODEL = "qwen3vl-32b-instruct"
 MAX_WIDTH = 1920
@@ -114,6 +116,7 @@ _snap_b64 = None
 _prev_hash = None
 _auto_running = False
 _auto_thread = None
+_auto_gen = 0   # generation counter: a stale _auto_loop thread exits when it mismatches
 _auto_status = ""
 _auto_answer = ""
 _auto_preview = None
@@ -508,7 +511,7 @@ def gpu_unload():
     return "⏹ Unloaded — VRAM freed.  " + gpu_status()
 
 
-def _auto_loop(interval, mode):
+def _auto_loop(interval, mode, gen):
     global _snap_b64, _auto_running, _auto_status, _auto_answer, _auto_preview
     global _auto_start_ts, _auto_stop_reason
     # Exam mode is intentionally excluded from hands-free auto-answering.
@@ -520,7 +523,9 @@ def _auto_loop(interval, mode):
     _auto_start_ts = time.time()
     _auto_stop_reason = ""
     _log(f"AUTO started (mode={mode}, interval={interval}s, max={AUTO_MAX_MIN:g}min)")
-    while _auto_running:
+    # gen mismatch = a stop-then-start replaced this loop while it slept; exit
+    # quietly instead of running alongside the new thread.
+    while _auto_running and gen == _auto_gen:
         # Anti "set and forget": self-stop after the max duration.
         if time.time() - _auto_start_ts > AUTO_MAX_SECONDS:
             _auto_stop_reason = f"AUTO auto-stopped after {AUTO_MAX_MIN:g} min — re-enable to continue."
@@ -545,14 +550,18 @@ def _auto_loop(interval, mode):
             _auto_status = "Error: " + str(e)
             _auto_update_event.set()
         time.sleep(interval)
-    _log("AUTO stopped" + (f" ({_auto_stop_reason})" if _auto_stop_reason else " (by user)"))
+    if gen != _auto_gen:
+        _log("AUTO stopped (superseded by a newer AUTO start)")
+    else:
+        _log("AUTO stopped" + (f" ({_auto_stop_reason})" if _auto_stop_reason else " (by user)"))
 
 
 def toggle_auto(is_on, interval, mode):
-    global _auto_running, _auto_thread
+    global _auto_running, _auto_thread, _auto_gen
     if is_on:
+        _auto_gen += 1
         _auto_running = True
-        _auto_thread = threading.Thread(target=_auto_loop, args=(interval, mode), daemon=True)
+        _auto_thread = threading.Thread(target=_auto_loop, args=(interval, mode, _auto_gen), daemon=True)
         _auto_thread.start()
         return gr.update(value="■ STOP AUTO", variant="stop")
     else:

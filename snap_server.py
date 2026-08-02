@@ -86,14 +86,11 @@ def _preflight():
 TOKEN = ""  # set in main() after preflight
 
 
-def _token_ok(req_path, headers):
-    """Constant-time check of the token from ?token= or the X-Auth-Token header."""
-    supplied = ""
-    q = parse_qs(urlparse(req_path).query)
-    if q.get("token"):
-        supplied = q["token"][0]
-    elif headers.get("X-Auth-Token"):
-        supplied = headers.get("X-Auth-Token")
+def _token_ok(headers):
+    """Constant-time check of the token from the X-Auth-Token header. A ?token=
+    query param is deliberately NOT accepted — URLs end up in browser history and
+    proxy logs, headers don't."""
+    supplied = headers.get("X-Auth-Token") or ""
     return bool(supplied) and hmac.compare_digest(supplied, TOKEN)
 
 # Which monitor /snap returns when no ?screen= is given. Accepts:
@@ -155,7 +152,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
         if path in ("/snap", "/snap.jpg", "/snap.png"):
-            if not _token_ok(self.path, self.headers):
+            if not _token_ok(self.headers):
                 self.send_response(403)
                 self.send_header("Content-Type", "text/plain")
                 self.end_headers()

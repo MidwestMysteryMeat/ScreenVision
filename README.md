@@ -76,9 +76,14 @@ provided **"AS IS", with no warranty and no author liability** (see
 
 - **`snap_server.py` requires a shared token.** It will not start without
   `SCREENVISION_TOKEN` set, and `/snap` returns **403** to any request without the
-  matching token (via `?token=` or an `X-Auth-Token` header). The screenshot
+  matching token in the `X-Auth-Token` header (a `?token=` query param is not
+  accepted — URLs leak into browser history and proxy logs). The screenshot
   endpoint is therefore never exposed unauthenticated. Bind it to same-machine
   only with `SCREENVISION_BIND=127.0.0.1` if the GPU host is the same PC.
+- **No TLS: the snap link is plain HTTP.** The shared token and the screen
+  images travel unencrypted between the two machines, so anyone who can sniff
+  the LAN segment can read both. Use it only on a trusted network you control,
+  and never across the internet.
 - **The UI defaults to localhost** (`127.0.0.1:7862`). To reach it from another
   machine, set `SCREENVISION_UI_BIND=0.0.0.0` **and** a login with
   `SCREENVISION_UI_USER` / `SCREENVISION_UI_PASS` (Gradio basic auth).
@@ -128,12 +133,13 @@ Requires `pillow` and `mss`. Serves token-gated `http://<this-pc-ip>:8765/snap`.
 ```
 set SCREENVISION_AGREE=1
 set SCREENVISION_TOKEN=<same-shared-secret>
+set SCREENVISION_SNAP_URL=http://<target-pc-ip>:8765/snap
 ollama pull qwen3vl-32b-instruct     # or any vision model
 python screen_vision.py              # Gradio UI on 127.0.0.1:7862
 ```
 Requires `gradio`, `pillow`, `numpy`, `matplotlib`, and a running Ollama with the
-model in `MODEL`. Edit `SNAP_URL` at the top of `screen_vision.py` to point at the
-target PC's IP. The UI is localhost-only by default; to reach it from another
+model in `MODEL`. `SCREENVISION_SNAP_URL` points at the target PC's snap server
+(defaults to a placeholder). The UI is localhost-only by default; to reach it from another
 machine set `SCREENVISION_UI_BIND=0.0.0.0` **and** `SCREENVISION_UI_USER`/`_PASS`.
 
 ## Using it
@@ -154,8 +160,9 @@ machine set `SCREENVISION_UI_BIND=0.0.0.0` **and** `SCREENVISION_UI_USER`/`_PASS
 5. Click **⏹ Unload GPU (free VRAM)** when done to release the GPU.
 
 ## Configuration knobs
-- `screen_vision.py`: `SNAP_URL` (set to the target PC's LAN IP), `OLLAMA`,
-  `MODEL`, `MAX_WIDTH`, server port (`demo.launch(... server_port=7862)`).
+- `screen_vision.py`: `SCREENVISION_SNAP_URL` env var (the target PC's snap
+  endpoint), `OLLAMA`, `MODEL`, `MAX_WIDTH`, server port
+  (`demo.launch(... server_port=7862)`).
 - `snap_server.py`: `PORT` (8765), `JPEG_QUALITY`.
 
 ## Known issues / gaps
@@ -178,12 +185,13 @@ From a review pass on 2026-07-02 (both files are syntax-clean and run):
 - **Threading**: the AUTO loop shares a few globals (`_prev_hash`, `_auto_answer`,
   `_auto_preview`) with the capture path without full locking — can briefly show a
   stale preview/answer. Cosmetic, not crashy.
-- **Config is edit-the-source**, not env/CLI flags (`SNAP_URL`, `MODEL`, ports).
+- **Config is partly edit-the-source** (`MODEL`, ports); the snap URL is env-driven
+  (`SCREENVISION_SNAP_URL`).
 
 ### Roadmap
 ~~Shared-token auth~~ (done) → optional TLS for the snap link → replace `eval`
-with a safe expression parser → env/CLI config for `SNAP_URL`/`MODEL` → AUTO
-plotting for Graph mode.
+with a safe expression parser → ~~env config for the snap URL~~ (done) → env/CLI
+config for `MODEL` → AUTO plotting for Graph mode.
 
 ## AI development note
 
