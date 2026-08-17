@@ -1,7 +1,7 @@
 import ast
 import operator
 import gradio as gr
-import urllib.request, urllib.parse, base64, json, io, threading, time, hashlib, os, sys
+import urllib.request, urllib.parse, urllib.error, base64, json, io, threading, time, hashlib, os, sys
 from PIL import Image
 
 # Target PC running snap_server.py. Set SCREENVISION_SNAP_URL to its LAN address,
@@ -183,6 +183,26 @@ def _build_request(b64, mode, custom_prompt=None, stream=True):
     }).encode()
 
 
+def _explain(e, what, url):
+    """Turn a bare urllib error into something the operator can act on. A raw
+    'HTTP Error 404: Not Found' in the status box says nothing about which of the
+    two hops (snap_server or Ollama) failed, or why."""
+    if isinstance(e, urllib.error.HTTPError):
+        if e.code == 404:
+            return (f"{what} failed: 404 from {url}. The host answered but that path "
+                    f"does not exist — check SCREENVISION_SNAP_URL (it must end in "
+                    f"/snap) and that MODEL '{MODEL}' is in `ollama list`.")
+        if e.code == 403:
+            return (f"{what} failed: 403 from {url}. snap_server rejected the token — "
+                    f"SCREENVISION_TOKEN must be identical on this host and the "
+                    f"captured PC.")
+        return f"{what} failed: HTTP {e.code} {e.reason} from {url}"
+    if isinstance(e, urllib.error.URLError):
+        return (f"{what} failed: cannot reach {url} ({e.reason}). Is snap_server.py "
+                f"running on the captured PC?")
+    return f"{what} failed: {type(e).__name__}: {e}"
+
+
 def capture():
     global _snap_b64, _prev_hash, _auto_preview, _auto_answer
     _auto_preview = None
@@ -194,7 +214,9 @@ def capture():
         _prev_hash = _thumb_hash(thumb)
         return img, "Ready.", ""
     except Exception as e:
-        return None, "Error: " + str(e), ""
+        msg = _explain(e, "Capture", _snap_url())
+        _log(msg)
+        return None, msg, ""
 
 
 def ask(question, mode):
@@ -212,7 +234,9 @@ def ask(question, mode):
         else:
             yield _ask_blocking(b64, mode, question.strip() or None), None
     except Exception as e:
-        yield "[Error: " + str(e) + "]", None
+        msg = _explain(e, "Answer", f"{OLLAMA}/api/chat")
+        _log(msg)
+        yield "[" + msg + "]", None
 
 
 def _ask_blocking(b64, mode, custom_prompt=None):
@@ -593,7 +617,52 @@ CSS = """
 }
 """
 
-with gr.Blocks(title="Screen Vision") as demo:
+# A page left open across a server restart keeps a session id the new process has
+# never heard of. Gradio then answers every event with 404: CAPTURE looks dead
+# (the old preview just stays put) and SEND sticks on "Thinking..." forever. The
+# page is unrecoverable without a manual reload, which is not obvious from the
+# UI — so detect it and reload once, throttled so it can never loop.
+HEAD_JS = """
+<script>
+(function () {
+  var KEY = "sv-stale-reload";
+  function recover(why) {
+    var last = parseInt(sessionStorage.getItem(KEY) || "0", 10);
+    if (Date.now() - last < 20000) return;
+    sessionStorage.setItem(KEY, String(Date.now()));
+    console.warn("[screen_vision] stale session (" + why + ") - reloading");
+    location.reload();
+  }
+  var origFetch = window.fetch;
+  window.fetch = function (input, init) {
+    return origFetch.call(this, input, init).then(function (res) {
+      var url = (res && res.url) ||
+                (typeof input === "string" ? input : (input && input.url) || "");
+      if (res && res.status === 404 && String(url).indexOf("/gradio_api/") !== -1) {
+        recover("404 " + url);
+      }
+      return res;
+    });
+  };
+  if (window.EventSource) {
+    var OrigES = window.EventSource;
+    var PatchedES = function (url, cfg) {
+      var es = new OrigES(url, cfg);
+      es.addEventListener("error", function () {
+        if (es.readyState === 2 && String(url).indexOf("/gradio_api/") !== -1) {
+          recover("event stream closed");
+        }
+      });
+      return es;
+    };
+    PatchedES.prototype = OrigES.prototype;
+    window.EventSource = PatchedES;
+  }
+})();
+</script>
+"""
+
+with gr.Blocks(title="Screen Vision", head=HEAD_JS) as demo:
     gr.Markdown(f"## Screen Vision — {MODEL}")
 
     with gr.Row():
@@ -675,7 +744,13 @@ if UI_BIND == "0.0.0.0" and not UI_AUTH:
           "Set SCREENVISION_UI_USER / SCREENVISION_UI_PASS to require one.", flush=True)
 
 def main():
-    demo.launch(server_name=UI_BIND, server_port=7862, inbrowser=True,
+    # Run as a background service (systemd, tmux) and the browser is opened
+    # separately by the desktop launcher — set SCREENVISION_OPEN_BROWSER=0 there.
+    open_browser = os.environ.get("SCREENVISION_OPEN_BROWSER", "1") == "1"
+    _log(f"snap source: {SNAP_URL}  (token {'set' if TOKEN else 'MISSING'})")
+    _log(f"model: {MODEL} via {OLLAMA}")
+    _log(f"UI: http://{UI_BIND}:7862  (login {'on' if UI_AUTH else 'off'})")
+    demo.launch(server_name=UI_BIND, server_port=7862, inbrowser=open_browser,
                 show_error=True, auth=UI_AUTH, css=CSS)
 
 
