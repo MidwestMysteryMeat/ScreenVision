@@ -77,11 +77,20 @@ SYSTEM_EXAM = (
     "ANSWER: <letter for multiple choice, or a short numeric answer>\n"
     "CALC: <one Python expression that evaluates to the numeric result, "
     "or the word none if it is not a calculation>\n"
-    "EQ: <if the question asks you to solve for a variable, rewrite it as one "
-    "Python expression in x that equals 0 at the correct x — move every term to "
-    "one side, e.g. `2**(3*x-1) - 16**x` for 2^(3x-1)=16^x; otherwise none>\n"
-    "OPTIONS: <letter=number pairs separated by ; e.g. A=-2; B=10; C=229.2; D=100, "
-    "strip $ and commas, write fractions as decimals; or the word none>\n"
+    "EQ: <if the question says solve, rewrite it as one expression that equals 0 "
+    "at the answer — move every term to one side, keeping the question's own "
+    "variable, e.g. `2**(3*x-1) - 16**x` for 2^(3x-1)=16^x, or `u**2 - 9*u - 22` "
+    "for (1/11)u^2-(9/11)u=2. A solve question must fill EQ, not CALC; otherwise "
+    "none>\n"
+    "SYM: <the expression the QUESTION asks you to evaluate, copied as a sympy "
+    "expression — do NOT solve or simplify it yourself. Use I for the imaginary "
+    "unit and explicit * for multiplication. 'Divide (2+3i) by (4-2i)' is "
+    "(2+3*I)/(4-2*I); 'Simplify i^101' is I**101; 'Express sqrt(-4)' is "
+    "sqrt(-4). Use none if the question is not one expression to evaluate>\n"
+    "OPTIONS: <letter=value pairs separated by ; e.g. A=-2; B=10; C=229.2; D=100, "
+    "strip $ and commas. Copy EVERY value an option lists — 'u = -2, u = 11' is "
+    "A=-2, 11, never just one of them. For exact answers copy the option as a "
+    "sympy expression, e.g. A=1/10 - 4*I/5. Use none if the options are words>\n"
     "WHY: <one sentence, 20 words maximum, saying how the answer follows>\n"
     "CALC rules: use ** for powers, log10 for common/decibel log, log for ln, "
     "log2, exp, sqrt, sin, cos, tan, pi, e. "
@@ -367,6 +376,166 @@ def _safe_calc_eval(expr, variables=None):
         raise ValueError(f"unsupported calc syntax: {type(node).__name__}")
 
     return float(evaluate(tree))
+
+
+# ── Symbolic kernel: exact answers, checked not voted ───────────────────────
+_SYM_NS = None
+
+
+def _sym_ns():
+    """The only names a symbolic expression may use."""
+    import sympy
+    global _SYM_NS
+    if _SYM_NS is None:
+        _SYM_NS = {
+            "I": sympy.I, "i": sympy.I, "j": sympy.I,
+            "pi": sympy.pi, "E": sympy.E, "e": sympy.E, "oo": sympy.oo,
+            **{c: sympy.Symbol(c) for c in "abcdfghkmnpqrstuvwxyz"},
+            "sqrt": sympy.sqrt, "cbrt": sympy.cbrt, "Rational": sympy.Rational,
+            "log": sympy.log, "ln": sympy.log, "exp": sympy.exp,
+            "sin": sympy.sin, "cos": sympy.cos, "tan": sympy.tan,
+            "Abs": sympy.Abs, "re": sympy.re, "im": sympy.im,
+            "factorial": sympy.factorial,
+        }
+    return _SYM_NS
+
+
+def _safe_sym(text):
+    """Validate against the calculator's AST whitelist, THEN hand to sympy.
+    parse_expr evaluates code underneath; the string is checked, not trusted."""
+    import sympy
+    from sympy.parsing.sympy_parser import parse_expr, standard_transformations
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("empty symbolic expression")
+    expr = text.strip().rstrip(".").replace("^", "**")
+    if len(expr) > 300:
+        raise ValueError("symbolic expression too long")
+    tree = ast.parse(expr, mode="eval")
+    if sum(1 for _ in ast.walk(tree)) > 120:
+        raise ValueError("symbolic expression too complex")
+    ns = _sym_ns()
+    allowed_nodes = (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Load,
+                     ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow,
+                     ast.Mod, ast.FloorDiv, ast.USub, ast.UAdd)
+    for node in ast.walk(tree):
+        if isinstance(node, allowed_nodes):
+            continue
+        if isinstance(node, ast.Constant):
+            if type(node.value) not in (int, float):
+                raise ValueError("only numeric constants")
+            continue
+        if isinstance(node, ast.Name):
+            if node.id not in ns:
+                raise ValueError(f"unknown name: {node.id}")
+            continue
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name) or node.func.id not in ns:
+                raise ValueError("only approved functions")
+            continue
+        raise ValueError(f"unsupported syntax: {type(node).__name__}")
+    globals_for_parser = {"Integer": sympy.Integer, "Float": sympy.Float,
+                          "Rational": sympy.Rational, "Symbol": sympy.Symbol}
+    return parse_expr(expr, local_dict=ns, global_dict=globals_for_parser,
+                      transformations=standard_transformations, evaluate=True)
+
+
+def _sym_equal(a, b):
+    """Exact first, numeric as a fallback for expressions simplify leaves alone."""
+    import sympy
+    try:
+        if sympy.simplify(a - b) == 0:
+            return True
+    except Exception:
+        pass
+    try:
+        diff = complex(sympy.N(a - b))
+        return abs(diff) < 1e-9
+    except Exception:
+        return False
+
+
+def _sym_match(value, option_texts):
+    """Which option equals this value? Returns "" when none does — a symbolic
+    answer that matches nothing on screen is a failed check, not a nearest miss."""
+    for key, text in option_texts.items():
+        try:
+            if _sym_equal(value, _safe_sym(text)):
+                return key
+        except Exception:
+            continue
+    return ""
+
+
+def _numbers_in(text):
+    """Every number an option mentions. "u = -2, u = 11" is two answers, not one
+    — flattening it to a single float is how "computed 11" ended up displayed as
+    "C. 2"."""
+    import re as _re
+    out = []
+    for tok in _re.findall(r"-?\d+(?:\.\d+)?(?:\s*/\s*\d+)?", text or ""):
+        try:
+            if "/" in tok:
+                num, den = tok.split("/")
+                out.append(float(num) / float(den))
+            else:
+                out.append(float(tok))
+        except Exception:
+            continue
+    return out
+
+
+def _sym_solve_eq(eq_text):
+    """Solve f(var)=0 exactly. The free symbol is inferred, so no extra contract
+    line is needed — the model already writes EQ for solve questions."""
+    import sympy
+    expr = _safe_sym(eq_text)
+    free = list(expr.free_symbols)
+    if len(free) != 1:
+        return []
+    solutions = sympy.solve(sympy.Eq(expr, 0), free[0])
+    return [s for s in solutions if s.is_real is not False]
+
+
+def _sym_set_match(solutions, option_texts):
+    """An option wins only if its numbers ARE the solution set — same count,
+    same values. A single-root option cannot claim a two-root answer."""
+    import sympy
+    try:
+        target = sorted(float(sympy.N(s)) for s in solutions)
+    except Exception:
+        return ""
+    if not target:
+        return ""
+    for key, text in option_texts.items():
+        found = sorted(_numbers_in(text))
+        if len(found) == len(target) and all(
+                abs(a - b) <= max(1e-6, abs(b) * 1e-6) for a, b in zip(found, target)):
+            return key
+    return ""
+
+
+def _parse_option_text(reply):
+    """Options kept as written, so symbolic ones survive (the numeric parser
+    drops anything float() cannot read)."""
+    for raw in (reply or "").splitlines():
+        s = raw.strip()
+        if not s.upper().startswith("OPTIONS:"):
+            continue
+        body = s.split(":", 1)[1].strip()
+        if body.lower() in ("none", "n/a", ""):
+            return {}
+        out = {}
+        parts = body.split(";") if ";" in body else body.split(",")
+        for part in parts:
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            key = key.strip().rstrip(".").upper()[:1]
+            value = value.strip().replace("$", "")
+            if key and value:
+                out[key] = value
+        return out
+    return {}
 
 
 def _parse_exam_spec(text):
@@ -887,28 +1056,70 @@ def _exam_sample(b64, custom_prompt, temperature):
         "eq": _line_after(reply, "EQ:").strip(),
         "why": _line_after(reply, "WHY:").strip(),
         "options": options,
+        "options_text": _parse_option_text(reply),
+        "sym": _line_after(reply, "SYM:").strip(),
         "computed": None,
     }
 
 
 def _verify_sample(s):
-    """Can Python prove this sample? Returns (letter, note, chosen_value) or None."""
+    """Can Python PROVE this sample? Returns (letter, note, chosen_value) or None.
+    Ordered strongest first: exact solution set, exact symbolic value, then the
+    numeric routes."""
     expr, eq, options = s["expr"], s["eq"], s["options"]
+    option_texts = s.get("options_text", {})
+    sym = s.get("sym", "")
+
+    # The equation is often written on the CALC line instead of EQ.
+    if expr and (not eq or eq.lower() in ("none", "n/a", "")):
+        try:
+            _safe_calc_eval(expr)
+        except Exception:
+            eq = expr
+
+    # An option listing several values is a solution SET. Nearest-number
+    # matching against it is meaningless — that is how a computed root of 11
+    # came out as "C. 2".
+    multi = any(len(_numbers_in(t)) > 1 for t in option_texts.values())
+
+    # 1. solve exactly and compare solution sets
+    if eq and eq.lower() not in ("none", "n/a", "") and option_texts:
+        try:
+            solutions = _sym_solve_eq(eq)
+        except Exception:
+            solutions = []
+        if solutions:
+            pick = _sym_set_match(solutions, option_texts)
+            if pick:
+                shown = ", ".join(str(v) for v in solutions)
+                return pick, f"solved exactly: {shown}", None
+
+    # 2. exact symbolic value (complex numbers, radicals, fractions)
+    if sym and sym.lower() not in ("none", "n/a", "") and option_texts:
+        try:
+            value = _safe_sym(sym)
+        except Exception:
+            value = None
+        if value is not None:
+            pick = _sym_match(value, option_texts)
+            if pick:
+                return pick, f"verified symbolically: {value}", None
+
+    # 3. plain arithmetic against single-valued numeric options
     if expr and expr.lower() not in ("none", "n/a", ""):
         try:
             val = _safe_calc_eval(expr)
         except Exception:
-            if options and not eq:
-                eq = expr           # the equation was written on the CALC line
+            pass
         else:
-            if options:
+            if options and not multi:
                 closest = min(options, key=lambda k: abs(options[k] - val))
                 return closest, f"computed {val:g}", options[closest]
-            # A number with no numeric option to match against proves nothing
-            # about the letter. Keep the value; let the mapping pass use it.
             s["computed"] = (val, expr)
             return None
-    if eq and eq.lower() not in ("none", "n/a", "") and options:
+
+    # 4. substitution against the printed options
+    if eq and eq.lower() not in ("none", "n/a", "") and options and not multi:
         pick, _residual = _solve_by_substitution(eq, options)
         if pick:
             return pick, "verified by substitution", options[pick]
