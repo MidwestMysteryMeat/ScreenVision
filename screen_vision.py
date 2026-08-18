@@ -404,6 +404,9 @@ def _parse_exam_spec(text):
 # GPU1 (the 16GB V100) is otherwise idle, and Ollama keeps two models resident
 # (OLLAMA_MAX_LOADED_MODELS=2), so the checker sits alongside the main VLM.
 CHECK_MODEL = os.environ.get("SCREENVISION_CHECK_MODEL", "gemma3:12b")
+# Second Ollama instance pinned to GPU1 (ollama-gpu1.service). Keeping the
+# checker on its own card means the two models never compete for VRAM.
+CHECK_URL = os.environ.get("SCREENVISION_CHECK_URL", "http://127.0.0.1:11435")
 _CROSSCHECK = True
 
 SYSTEM_CHECK = (
@@ -428,7 +431,7 @@ def set_crosscheck(enabled):
     return f"Cross-check: {'on (' + CHECK_MODEL + ')' if _CROSSCHECK else 'off'}"
 
 
-def _ask_model(model, system, b64, prompt, num_predict=8, timeout=240):
+def _ask_model(model, system, b64, prompt, num_predict=8, timeout=240, base=None):
     body = json.dumps({
         "model": model,
         "messages": [{"role": "system", "content": system},
@@ -436,10 +439,23 @@ def _ask_model(model, system, b64, prompt, num_predict=8, timeout=240):
         "stream": False,
         "options": {"num_ctx": 4096, "num_predict": num_predict, "temperature": 0},
     }).encode()
-    req = urllib.request.Request(f"{OLLAMA}/api/chat", data=body,
+    req = urllib.request.Request(f"{base or OLLAMA}/api/chat", data=body,
                                  headers={"Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode()).get("message", {}).get("content", "") or ""
+
+
+def _pin_checker():
+    """Keep the checker resident on GPU1 so it never cold-loads mid-question."""
+    try:
+        payload = json.dumps({"model": CHECK_MODEL, "keep_alive": -1}).encode()
+        req = urllib.request.Request(f"{CHECK_URL}/api/generate", data=payload,
+                                     headers={"Content-Type": "application/json"},
+                                     method="POST")
+        with urllib.request.urlopen(req, timeout=300):
+            return True
+    except Exception:
+        return False
 
 
 def _first_letter(text):
@@ -460,32 +476,34 @@ def _reconcile(b64, mine, other):
 
 
 def _cross_check(b64, letter):
-    """Returns (final_letter, note). final_letter is "" when nothing changed."""
+    """Returns (final_letter, note, reconcile_why). final_letter is "" when
+    nothing changed; reconcile_why replaces the original WHY when it exists."""
     if not _CROSSCHECK or not letter:
-        return "", ""
+        return "", "", ""
     mine = letter.strip()[:1].upper()
     if not mine.isalpha():
-        return "", ""
+        return "", "", ""
     short = CHECK_MODEL.split(":")[0]
     try:
         raw = _ask_model(CHECK_MODEL, SYSTEM_CHECK, b64,
-                         "Which option is correct? Reply with the letter only.")
+                         "Which option is correct? Reply with the letter only.",
+                         base=CHECK_URL)
     except Exception as e:
-        return "", f"[cross-check unavailable: {type(e).__name__}]"
+        return "", f"[cross-check unavailable: {type(e).__name__}]", ""
     other = _first_letter(raw)
     if not other:
-        return "", ""
+        return "", "", ""
     if other == mine:
-        return "", f"\u2713 confirmed by {short}"
+        return "", f"\u2713 confirmed by {short}", ""
     final, why = _reconcile(b64, mine, other)
     if not final:
-        return "", f"\u26a0 {short} says {other} \u2014 unresolved, check this one"
+        return "", f"\u26a0 {short} says {other} \u2014 unresolved, check this one", ""
     tail = f" \u2014 {why}" if why else ""
     if final == mine:
-        return "", f"\u2713 {short} said {other}; re-checked, {mine} stands{tail}"
+        return "", f"\u2713 {short} said {other}; re-checked, {mine} stands", why
     if final == other:
-        return final, f"\u21bb changed to {final} \u2014 {short} caught it{tail}"
-    return final, f"\u21bb changed to {final} (was {mine}, {short} said {other}){tail}"
+        return final, f"\u21bb changed to {final} \u2014 {short} caught it", why
+    return final, f"\u21bb changed to {final} (was {mine}, {short} said {other})", why
 
 
 # ── Research: optional retrieval for non-math questions ──────────────────────
@@ -836,6 +854,11 @@ def _exam_answer(b64, custom_prompt=None):
             val = _safe_calc_eval(expr)
         except Exception as e:
             calc_note = f"[calc failed: {e}]"
+            # The model routinely writes the *equation* on the CALC line, which
+            # the arithmetic sandbox cannot evaluate ("unknown name: x"). With
+            # options on screen that is still checkable — treat it as an EQ.
+            if options and not eq:
+                eq = expr
         else:
             if options:
                 closest = min(options, key=lambda k: abs(options[k] - val))
@@ -851,12 +874,15 @@ def _exam_answer(b64, custom_prompt=None):
         if pick:
             return out(f"{pick}. {options[pick]:g}", "verified by substitution",
                        options[pick])
+        calc_note = calc_note or ""
         if residual is not None:
             calc_note = calc_note or "[no option satisfies the equation]"
 
     # Nothing was verified by Python — this is where a second opinion earns its
     # time, and the only place it is spent.
-    final_letter, second = _cross_check(b64, letter)
+    final_letter, second, reconcile_why = _cross_check(b64, letter)
+    if reconcile_why:
+        why = reconcile_why        # one explanation, from whoever decided
     note = "\n".join(x for x in (calc_note, second) if x)
     if _RESEARCH != "Off":
         return out(_research_answer(b64, letter, reply), note)
@@ -1135,6 +1161,8 @@ def gpu_load():
     t0 = time.time()
     try:
         _ollama_post("/api/generate", {"model": MODEL, "keep_alive": -1}, timeout=240)
+        if _CROSSCHECK:
+            _pin_checker()       # pin the checker on GPU1 in the same click
     except Exception as e:
         return f"❌ Load failed: {e}"
     return f"⚡ Loaded in {time.time() - t0:.1f}s.  " + gpu_status()
