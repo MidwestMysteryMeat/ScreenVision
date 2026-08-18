@@ -104,6 +104,66 @@ class ScreenVisionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             screen_vision._safe_calc_eval("__import__('os').system('whoami')")
 
+    def test_calc_eval_allows_round_and_dotted_math(self):
+        self.assertAlmostEqual(
+            screen_vision._safe_calc_eval("round(2500*(1+0.045/4)**16, 2)"), 2990.04, places=2)
+        self.assertAlmostEqual(screen_vision._safe_calc_eval("math.log10(1000)"), 3.0, places=9)
+
+    def test_calc_eval_refuses_to_hang_on_huge_exponents(self):
+        with self.assertRaises(ValueError):
+            screen_vision._safe_calc_eval("9**9**9")
+
+    def test_option_list_survives_thousands_separators(self):
+        _letter, _expr, options = screen_vision._parse_exam_spec(
+            "ANSWER: C\nCALC: 1+1\nOPTIONS: A=$2,545.38; B=$2,990.03; C=$13,763.86\n")
+        self.assertEqual(options, {"A": 2545.38, "B": 2990.03, "C": 13763.86})
+
+    def test_research_off_costs_no_extra_model_calls(self):
+        """Default path must stay one call — the whole point of the opt-in gate."""
+        calls = []
+
+        def fake_ask(_b64, mode, _prompt=None):
+            calls.append(mode)
+            return "ANSWER: B\nCALC: none\nOPTIONS: none\n"
+
+        with mock.patch.object(screen_vision, "_ask_blocking", fake_ask), \
+                mock.patch.object(screen_vision, "_RESEARCH", "Off"):
+            out = screen_vision._exam_answer("fake-b64")
+        self.assertEqual(calls, ["Exam"])
+        self.assertEqual(out, "B")
+
+    def test_research_cites_its_source_when_evidence_supports_an_option(self):
+        def fake_ask(_b64, mode, _prompt=None):
+            if mode == "Transcribe":
+                return "Which organelle performs photosynthesis?\nA. Ribosome\nB. Chloroplast"
+            return "ANSWER: A\nCALC: none\nOPTIONS: none\n"
+
+        with mock.patch.object(screen_vision, "_ask_blocking", fake_ask), \
+                mock.patch.object(screen_vision, "_RESEARCH", "Wikipedia"), \
+                mock.patch.object(screen_vision, "_wiki_search", lambda q, n=3: [
+                    ("Wikipedia — Chloroplast", "http://x", "Chloroplasts conduct photosynthesis.")]), \
+                mock.patch.object(screen_vision, "_text_ask",
+                                  lambda *a, **k: "ANSWER: B\nCITE: Chloroplasts conduct photosynthesis."):
+            out = screen_vision._exam_answer("fake-b64")
+        self.assertTrue(out.startswith("B"), out)
+        self.assertIn("Chloroplasts conduct photosynthesis", out)
+        self.assertIn("Wikipedia — Chloroplast", out)
+        self.assertIn("model first said A", out)
+
+    def test_research_says_so_instead_of_failing_open(self):
+        """No evidence must be announced, not silently swapped for a guess."""
+        def fake_ask(_b64, mode, _prompt=None):
+            if mode == "Transcribe":
+                return "Some question?\nA. one\nB. two"
+            return "ANSWER: A\nCALC: none\nOPTIONS: none\n"
+
+        with mock.patch.object(screen_vision, "_ask_blocking", fake_ask), \
+                mock.patch.object(screen_vision, "_RESEARCH", "Wikipedia"), \
+                mock.patch.object(screen_vision, "_wiki_search", lambda q, n=3: []):
+            out = screen_vision._exam_answer("fake-b64")
+        self.assertIn("model's own answer", out)
+        self.assertTrue(out.startswith("A"), out)
+
 
 if __name__ == "__main__":
     unittest.main()

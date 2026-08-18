@@ -182,6 +182,10 @@ def _build_request(b64, mode, custom_prompt=None, stream=True):
         system = SYSTEM_GRAPH
         prompt = custom_prompt or PROMPT_GRAPH
         num_predict = 500
+    elif mode == "Transcribe":
+        system = SYSTEM_TRANSCRIBE
+        prompt = "Transcribe the question and its options."
+        num_predict = 320
     else:
         system = SYSTEM_EXAM
         prompt = custom_prompt or PROMPT_EXAM
@@ -389,11 +393,285 @@ def _parse_exam_spec(text):
     return letter, expr, options
 
 
+# ── Research: optional retrieval for non-math questions ──────────────────────
+# The calculator makes an answer *correct* (one deterministic value, matched to
+# an option). Retrieval cannot do that — it makes an answer *auditable*: you get
+# the letter plus the sentence behind it, so a wrong one is visible in seconds.
+RESEARCH_MODES = ["Off", "Wikipedia", "Course notes", "Web"]
+_RESEARCH = "Off"
+
+# Wikimedia asks for a descriptive User-Agent; anonymous read traffic at human
+# pace (a few queries a minute) is far below any published limit.
+RESEARCH_UA = os.environ.get(
+    "SCREENVISION_UA",
+    "ScreenVision/1.0 (personal study tool; https://github.com/MidwestMysteryMeat/ScreenVision)")
+NOTES_DIR = os.environ.get("SCREENVISION_NOTES_DIR",
+                           os.path.expanduser("~/screenvision_notes"))
+EMBED_MODEL = os.environ.get("SCREENVISION_EMBED_MODEL", "nomic-embed-text")
+# No public instance is assumed. Point this at a local or trusted SearXNG with
+# the JSON API enabled; empty means the Web backend reports itself unavailable.
+SEARXNG_URL = os.environ.get("SCREENVISION_SEARXNG_URL", "").rstrip("/")
+
+_wiki_cache = {}
+_notes_index = None          # [(source, chunk_text, vector)]
+_notes_sig = None            # cheap fingerprint of the notes dir
+
+
+def set_research(mode):
+    global _RESEARCH
+    _RESEARCH = mode if mode in RESEARCH_MODES else "Off"
+    if _RESEARCH == "Web" and not SEARXNG_URL:
+        return "Research: Web selected but SCREENVISION_SEARXNG_URL is unset."
+    if _RESEARCH == "Course notes" and not os.path.isdir(NOTES_DIR):
+        return f"Research: notes folder not found ({NOTES_DIR})."
+    return f"Research: {_RESEARCH}" + ("" if _RESEARCH == "Off" else " (slower)")
+
+
+def _get_json(url, timeout=12):
+    req = urllib.request.Request(url, headers={"User-Agent": RESEARCH_UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _wiki_search(query, n=3):
+    """Wikipedia search + plain-text intro extracts. No key, no scraping."""
+    key = (query, n)
+    if key in _wiki_cache:
+        return _wiki_cache[key]
+    api = "https://en.wikipedia.org/w/api.php"
+    hits = _get_json(f"{api}?action=query&format=json&list=search&srlimit={n}"
+                     f"&srsearch={urllib.parse.quote(query)}")
+    titles = [h["title"] for h in hits.get("query", {}).get("search", [])]
+    out = []
+    if titles:
+        joined = "|".join(urllib.parse.quote(t) for t in titles)
+        pages = _get_json(f"{api}?action=query&format=json&prop=extracts"
+                          f"&explaintext=1&exsentences=6&exintro=1&titles={joined}")
+        for page in pages.get("query", {}).get("pages", {}).values():
+            text = (page.get("extract") or "").strip()
+            if text:
+                title = page.get("title", "?")
+                out.append((f"Wikipedia — {title}",
+                            f"https://en.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}",
+                            text[:1500]))
+    _wiki_cache[key] = out
+    return out
+
+
+def _read_text_file(path):
+    if path.lower().endswith(".pdf"):
+        try:
+            from pypdf import PdfReader
+        except Exception:
+            try:
+                from PyPDF2 import PdfReader   # older name
+            except Exception:
+                return ""
+        try:
+            return "\n".join((pg.extract_text() or "") for pg in PdfReader(path).pages)
+        except Exception:
+            return ""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except Exception:
+        return ""
+
+
+def _notes_files():
+    exts = (".txt", ".md", ".markdown", ".pdf")
+    found = []
+    for root, _dirs, files in os.walk(NOTES_DIR):
+        for name in sorted(files):
+            if name.lower().endswith(exts):
+                found.append(os.path.join(root, name))
+    return found
+
+
+def _ollama_embed(texts):
+    """/api/embed is the current batch endpoint; older builds only have the
+    single-string /api/embeddings."""
+    try:
+        data = _ollama_post("/api/embed", {"model": EMBED_MODEL, "input": texts}, timeout=180)
+        vecs = data.get("embeddings")
+        if vecs and len(vecs) == len(texts):
+            return vecs
+    except Exception:
+        pass
+    out = []
+    for t in texts:
+        d = _ollama_post("/api/embeddings", {"model": EMBED_MODEL, "prompt": t}, timeout=180)
+        out.append(d.get("embedding") or [])
+    return out
+
+
+def _cosine(a, b):
+    import math as _m
+    if not a or not b:
+        return -1.0
+    num = sum(x * y for x, y in zip(a, b))
+    na = _m.sqrt(sum(x * x for x in a)) or 1.0
+    nb = _m.sqrt(sum(y * y for y in b)) or 1.0
+    return num / (na * nb)
+
+
+def _build_notes_index():
+    """Chunk + embed everything in NOTES_DIR. Rebuilt only when the folder's
+    (name, size, mtime) fingerprint changes, so repeat questions are instant."""
+    global _notes_index, _notes_sig
+    files = _notes_files()
+    sig = tuple((p, os.path.getsize(p), int(os.path.getmtime(p))) for p in files)
+    if _notes_index is not None and sig == _notes_sig:
+        return _notes_index
+    chunks, sources = [], []
+    for path in files:
+        text = " ".join(_read_text_file(path).split())
+        step = 700
+        for i in range(0, len(text), step):
+            piece = text[i:i + step + 120]      # small overlap so sentences survive
+            if len(piece) > 80:
+                chunks.append(piece)
+                sources.append(os.path.relpath(path, NOTES_DIR))
+    if not chunks:
+        _notes_index, _notes_sig = [], sig
+        return _notes_index
+    vectors = _ollama_embed(chunks)
+    _notes_index = [(s, c, v) for s, c, v in zip(sources, chunks, vectors) if v]
+    _notes_sig = sig
+    print(f"[screen_vision] notes index: {len(_notes_index)} chunks "
+          f"from {len(files)} file(s)", flush=True)
+    return _notes_index
+
+
+def _notes_search(query, n=3):
+    index = _build_notes_index()
+    if not index:
+        return []
+    qv = _ollama_embed([query])[0]
+    scored = sorted(index, key=lambda row: _cosine(qv, row[2]), reverse=True)
+    return [(f"Course notes — {src}", src, chunk) for src, chunk, _v in scored[:n]]
+
+
+def _web_search(query, n=3):
+    """SearXNG JSON API. Deliberately not DuckDuckGo: html.duckduckgo.com answers
+    202 with a bot challenge and no results, browser User-Agent or not."""
+    if not SEARXNG_URL:
+        return []
+    data = _get_json(f"{SEARXNG_URL}/search?format=json&q={urllib.parse.quote(query)}",
+                     timeout=15)
+    out = []
+    for item in (data.get("results") or [])[:n]:
+        body = (item.get("content") or "").strip()
+        if body:
+            out.append((f"Web — {item.get('title', '?')}", item.get("url", ""), body[:1200]))
+    return out
+
+
+def _research_ready():
+    """Is the selected backend actually usable? Checked before the
+    transcription call so an unusable backend costs nothing."""
+    if _RESEARCH == "Web" and not SEARXNG_URL:
+        return False, "no SearXNG endpoint configured (SCREENVISION_SEARXNG_URL)"
+    if _RESEARCH == "Course notes" and not os.path.isdir(NOTES_DIR):
+        return False, f"notes folder not found ({NOTES_DIR})"
+    return True, ""
+
+
+def _gather_evidence(query):
+    """Returns (evidence_list, error_string). Never raises into the UI."""
+    if _RESEARCH == "Off" or not query:
+        return [], ""
+    try:
+        if _RESEARCH == "Wikipedia":
+            return _wiki_search(query), ""
+        if _RESEARCH == "Course notes":
+            if not os.path.isdir(NOTES_DIR):
+                return [], f"notes folder not found: {NOTES_DIR}"
+            return _notes_search(query), ""
+        if _RESEARCH == "Web":
+            if not SEARXNG_URL:
+                return [], "no SearXNG endpoint configured (SCREENVISION_SEARXNG_URL)"
+            return _web_search(query), ""
+    except Exception as e:
+        return [], f"{_RESEARCH} lookup failed: {type(e).__name__}: {e}"
+    return [], ""
+
+
+SYSTEM_TRANSCRIBE = (
+    "Transcribe the question shown on screen, then each answer option on its own "
+    "line, exactly as written. Do NOT answer it. Do NOT add commentary."
+)
+
+SYSTEM_EVIDENCE = (
+    "You answer a multiple-choice question using ONLY the reference text provided. "
+    "Do not use outside knowledge.\n"
+    "Reply with exactly two lines:\n"
+    "ANSWER: <the option letter, or the word none if the reference does not "
+    "support any option>\n"
+    "CITE: <one quote of 25 words or fewer, copied from the reference, that "
+    "supports the answer>"
+)
+
+
+def _text_ask(system, prompt, num_predict=220, timeout=120):
+    body = json.dumps({
+        "model": MODEL,
+        "messages": [{"role": "system", "content": system},
+                     {"role": "user", "content": prompt}],
+        "stream": False,
+        "options": {"num_ctx": 8192, "num_predict": num_predict, "temperature": 0.1},
+    }).encode()
+    req = urllib.request.Request(f"{OLLAMA}/api/chat", data=body,
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode()).get("message", {}).get("content", "") or ""
+
+
+def _line_after(text, tag):
+    for raw in (text or "").splitlines():
+        if raw.strip().upper().startswith(tag):
+            return raw.split(":", 1)[1].strip()
+    return ""
+
+
+def _research_answer(b64, letter, fallback_text):
+    """Non-math path with a backend selected: transcribe → retrieve → cite."""
+    own = (letter or fallback_text or "").strip()
+    ready, why = _research_ready()
+    if not ready:
+        return f"{own}\n[research: {why} — model's own answer]"
+    question = _ask_blocking(b64, "Transcribe", None).strip()
+    if not question:
+        return f"{own}\n[research: could not read the question — model's own answer]"
+    evidence, err = _gather_evidence(" ".join(question.split()[:32]))
+    if not evidence:
+        why = err or f"nothing found via {_RESEARCH}"
+        return f"{own}\n[research: {why} — model's own answer]"
+    block = "\n\n".join(f"[{i + 1}] {title}\n{text}"
+                          for i, (title, _url, text) in enumerate(evidence))
+    reply = _text_ask(SYSTEM_EVIDENCE, f"REFERENCE:\n{block}\n\nQUESTION:\n{question}")
+    ans = _line_after(reply, "ANSWER:")
+    cite = _line_after(reply, "CITE:").strip().strip('"').strip("'").strip()
+    src = evidence[0][0]
+    if not ans or ans.lower().startswith("none"):
+        return (f"{own}\n[research: {_RESEARCH} found no support for any option — "
+                f"model's own answer]")
+    out = ans if not cite else f"{ans}\n\u201c{cite}\u201d"
+    out += f"\n— {src}"
+    if letter and ans.strip()[:1].upper() != letter.strip()[:1].upper():
+        out += f"\n(model first said {letter})"
+    return out
+
+
 def _exam_answer(b64, custom_prompt=None):
-    """VLM reads the screen; Python computes. Calculator wins ties vs the letter."""
+    """VLM reads the screen; Python computes. Calculator wins ties vs the letter.
+    Non-math questions fall through to Research only if a backend is selected —
+    the math path stays exactly one model call."""
     reply = _ask_blocking(b64, "Exam", custom_prompt)
     letter, expr, options = _parse_exam_spec(reply)
     if not expr or expr.lower() in ("none", "n/a", ""):
+        if _RESEARCH != "Off":
+            return _research_answer(b64, letter, reply)
         return letter or reply
     try:
         val = _safe_calc_eval(expr)
@@ -835,6 +1113,8 @@ with gr.Blocks(title="Screen Vision", head=HEAD_JS) as demo:
             mode_radio = gr.Radio(choices=["Exam", "Business", "Graph"], value="Exam", label="Mode")
             monitor_dd = gr.Dropdown(choices=["left", "right", "primary", "all", "1", "2"],
                                      value=_MONITOR, label="Monitor (which screen to capture)")
+            research_dd = gr.Dropdown(choices=RESEARCH_MODES, value=_RESEARCH,
+                                      label="Research (non-math only — adds ~10s when on)")
             btn_cap = gr.Button("CAPTURE", variant="primary")
             btn_ask = gr.Button("SEND", variant="primary")
             gr.Markdown(
@@ -871,6 +1151,7 @@ with gr.Blocks(title="Screen Vision", head=HEAD_JS) as demo:
                 gpu_load, outputs=gpu_state_box)
             btn_gpu_unload.click(gpu_unload, outputs=gpu_state_box)
             monitor_dd.change(set_monitor, inputs=monitor_dd, outputs=status)
+            research_dd.change(set_research, inputs=research_dd, outputs=status)
             mode_radio.change(lambda m: gr.update(visible=(m == "Graph")),
                               inputs=mode_radio, outputs=graph_out)
 
