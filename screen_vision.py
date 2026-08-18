@@ -1951,6 +1951,25 @@ def gpu_status():
     return "⚪ GPU idle — no model loaded (first CAPTURE cold-loads ~12s)"
 
 
+_gpu_status_primary = gpu_status
+
+
+def gpu_status():
+    """Report both cards. The primary sits on GPU0 and the checker on GPU1, and
+    describing only one of them is how 8GB stayed resident unnoticed."""
+    main = _gpu_status_primary()
+    try:
+        data = _checker_ps()
+    except Exception:
+        return f"{main}   |   GPU1: unreachable"
+    models = data.get("models", [])
+    if not models:
+        return f"{main}   |   GPU1: idle"
+    vram = sum(m.get("size_vram") or 0 for m in models)
+    names = ", ".join(m.get("name", "?") for m in models)
+    return f"{main}   |   GPU1: {names} {_fmt_bytes(vram)}"
+
+
 def gpu_load():
     """Preload MODEL into VRAM and pin it (keep_alive=-1) so it survives the idle timeout."""
     t0 = time.time()
@@ -1963,14 +1982,36 @@ def gpu_load():
     return f"⚡ Loaded in {time.time() - t0:.1f}s.  " + gpu_status()
 
 
+def _checker_ps():
+    """What the GPU1 instance currently holds."""
+    with urllib.request.urlopen(f"{CHECK_URL}/api/ps", timeout=3) as r:
+        return json.loads(r.read().decode())
+
+
+def _unpin_checker():
+    """Release the checker on GPU1. It is pinned with keep_alive=-1 so that it
+    never cold-loads mid-question, which also means it never expires on its own."""
+    try:
+        payload = json.dumps({"model": CHECK_MODEL, "keep_alive": 0}).encode()
+        req = urllib.request.Request(f"{CHECK_URL}/api/generate", data=payload,
+                                     headers={"Content-Type": "application/json"},
+                                     method="POST")
+        with urllib.request.urlopen(req, timeout=60):
+            return True
+    except Exception:
+        return False
+
+
 def gpu_unload():
-    """Unload MODEL from VRAM immediately (keep_alive=0) — frees the GPU."""
+    """Free both cards. Load pins both, so Unload has to release both."""
     try:
         _ollama_post("/api/generate", {"model": MODEL, "keep_alive": 0}, timeout=30)
     except Exception as e:
         return f"❌ Unload failed: {e}"
+    checker_freed = _unpin_checker()
     time.sleep(1.0)
-    return "⏹ Unloaded — VRAM freed.  " + gpu_status()
+    note = "" if checker_freed else "  (GPU1 checker did not respond)"
+    return "⏹ Unloaded — VRAM freed." + note + "  " + gpu_status()
 
 
 def _auto_loop(interval, mode, gen):
