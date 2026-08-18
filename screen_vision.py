@@ -87,6 +87,13 @@ SYSTEM_EXAM = (
     "unit and explicit * for multiplication. 'Divide (2+3i) by (4-2i)' is "
     "(2+3*I)/(4-2*I); 'Simplify i^101' is I**101; 'Express sqrt(-4)' is "
     "sqrt(-4). Use none if the question is not one expression to evaluate>\n"
+    "CHECK: <if each option gives values for named quantities, write the "
+    "conditions the question states as expressions that equal 0 for the correct "
+    "option, separated by ; and using those names — e.g. for 'area 240, base is "
+    "2 less than twice the height' write `b*h/2 - 240; b - (2*h - 2)`; "
+    "otherwise none>\n"
+    "VARS: <the names used in CHECK, in the order the options list them, "
+    "e.g. h,b; otherwise none>\n"
     "OPTIONS: <letter=value pairs separated by ; e.g. A=-2; B=10; C=229.2; D=100, "
     "strip $ and commas. Copy EVERY value an option lists — 'u = -2, u = 11' is "
     "A=-2, 11, never just one of them. For exact answers copy the option as a "
@@ -1058,8 +1065,37 @@ def _exam_sample(b64, custom_prompt, temperature):
         "options": options,
         "options_text": _parse_option_text(reply),
         "sym": _line_after(reply, "SYM:").strip(),
+        "check": _line_after(reply, "CHECK:").strip(),
+        "vars": _line_after(reply, "VARS:").strip(),
         "computed": None,
     }
+
+
+def _check_options(check_text, vars_text, option_texts):
+    """Substitute each option's numbers into the stated conditions. An option
+    wins only by satisfying every one of them — a computed number that was never
+    compared to the requirement is not evidence."""
+    names = [v.strip() for v in (vars_text or "").replace(";", ",").split(",") if v.strip()]
+    checks = [c.strip() for c in (check_text or "").split(";") if c.strip()]
+    if not names or not checks:
+        return "", ""
+    winners = []
+    for key, text in option_texts.items():
+        values = _numbers_in(text)
+        if len(values) != len(names):
+            continue
+        binding = dict(zip(names, values))
+        try:
+            residuals = [abs(_safe_calc_eval(c, binding)) for c in checks]
+        except Exception:
+            continue
+        if all(r <= max(1e-6, 1e-9 * max(1.0, abs(v))) for r, v in
+               zip(residuals, values * len(residuals))):
+            shown = ", ".join(f"{n}={v:g}" for n, v in binding.items())
+            winners.append((key, shown))
+    if len(winners) == 1:
+        return winners[0]
+    return "", ""
 
 
 def _verify_sample(s):
@@ -1082,7 +1118,16 @@ def _verify_sample(s):
     # came out as "C. 2".
     multi = any(len(_numbers_in(t)) > 1 for t in option_texts.values())
 
-    # 1. solve exactly and compare solution sets
+    # 1. check each option against the conditions the question states
+    check_text = s.get("check", "")
+    vars_text = s.get("vars", "")
+    if (check_text and check_text.lower() not in ("none", "n/a", "")
+            and option_texts):
+        pick, shown = _check_options(check_text, vars_text, option_texts)
+        if pick:
+            return pick, f"satisfies the conditions: {shown}", None
+
+    # 2. solve exactly and compare solution sets
     if eq and eq.lower() not in ("none", "n/a", "") and option_texts:
         try:
             solutions = _sym_solve_eq(eq)
