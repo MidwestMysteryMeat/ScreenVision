@@ -95,6 +95,10 @@ SYSTEM_EXAM = (
     "expression is equivalent' question is a SYM question, and then copy each "
     "option into OPTIONS the same way, e.g. A=x**3 - x**2 - x + 1. "
     "Use none only if the question is not an expression to evaluate>\n"
+    "VERTEX: <if the question asks for the vertex, maximum, minimum or turning "
+    "point of a quadratic, copy the quadratic itself as a sympy expression in x, "
+    "e.g. `2*x**2 - 3*x - 7` — do not compute the vertex yourself; "
+    "otherwise none>\n"
     "DIV: <if the question divides one polynomial by another, write "
     "`dividend ; divisor` as sympy expressions, e.g. "
     "`2*x**3 + 3*x**2 - 4*x + 15 ; x + 3`; otherwise none>\n"
@@ -1078,6 +1082,7 @@ def _exam_sample(b64, custom_prompt, temperature):
         "options": options,
         "options_text": _parse_option_text(reply),
         "sym": _line_after(reply, "SYM:").strip(),
+        "vertex": _line_after(reply, "VERTEX:").strip(),
         "div": _line_after(reply, "DIV:").strip(),
         "check": _line_after(reply, "CHECK:").strip(),
         "vars": _line_after(reply, "VARS:").strip(),
@@ -1165,6 +1170,25 @@ def _no_solution_option(option_texts):
     return ""
 
 
+def _sym_vertex(expr_text):
+    """(h, k) for a quadratic, exactly. Returns None if it is not quadratic."""
+    import sympy
+    expr = _safe_sym(expr_text)
+    symbols = list(expr.free_symbols)
+    if len(symbols) != 1:
+        return None
+    var = symbols[0]
+    poly = sympy.Poly(sympy.expand(expr), var)
+    if poly.degree() != 2:
+        return None
+    a, b, _c = poly.all_coeffs()
+    if a == 0:
+        return None
+    h = sympy.simplify(-b / (2 * a))
+    k = sympy.simplify(expr.subs(var, h))
+    return h, k
+
+
 def _verify_sample(s):
     """Can Python PROVE this sample? Returns (letter, note, chosen_value) or None.
     Ordered strongest first: exact solution set, exact symbolic value, then the
@@ -1194,7 +1218,21 @@ def _verify_sample(s):
         if pick:
             return pick, f"satisfies the conditions: {shown}", None
 
-    # 2. polynomial division — the answer is a pair, so match it as one
+    # 2. vertex / turning point — options are pairs, sometimes just the value
+    vertex_text = s.get("vertex", "")
+    if vertex_text and vertex_text.lower() not in ("none", "n/a", "") and option_texts:
+        try:
+            vertex = _sym_vertex(vertex_text)
+        except Exception:
+            vertex = None
+        if vertex:
+            pick = _sym_tuple_match(vertex, option_texts)
+            if not pick:                    # "what is the maximum value" — k only
+                pick = _sym_match(vertex[1], option_texts)
+            if pick:
+                return pick, f"vertex computed exactly: ({vertex[0]}, {vertex[1]})", None
+
+    # 3. polynomial division — the answer is a pair, so match it as one
     div_text = s.get("div", "")
     if div_text and div_text.lower() not in ("none", "n/a", "") and option_texts:
         try:
