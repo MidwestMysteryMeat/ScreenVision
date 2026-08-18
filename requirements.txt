@@ -5,6 +5,11 @@ gradio
 pillow
 numpy
 matplotlib
+sympy          # exact answers: solving, symbolic comparison, polynomial division
+
+# Optional (GPU host): read .pdf course material for the Course notes research
+# backend. Plain .txt and .md work without it.
+# pypdf
 
 # Target PC (runs snap_server.py):
 # pillow  (already above)
