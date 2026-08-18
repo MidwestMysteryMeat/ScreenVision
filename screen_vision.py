@@ -77,7 +77,11 @@ SYSTEM_EXAM = (
     "ANSWER: <letter for multiple choice, or a short numeric answer>\n"
     "CALC: <one Python expression that evaluates to the numeric result, "
     "or the word none if it is not a calculation>\n"
-    "EQ: <if the question says solve, rewrite it as one expression that equals 0 "
+    "EQ: <if the question says solve, move every term to ONE side and write that "
+    "expression, exactly as the question states it — do NOT square both sides, "
+    "clear radicals, expand or simplify first, because Python solves it exactly "
+    "and discards extraneous roots. sqrt(1-3x)=x-1 is `sqrt(1-3*x) - (x-1)`, "
+    "never `x**2 + x`. Old wording follows: rewrite it as one expression that equals 0 "
     "at the answer — move every term to one side, keeping the question's own "
     "variable, e.g. `2**(3*x-1) - 16**x` for 2^(3x-1)=16^x, or `u**2 - 9*u - 22` "
     "for (1/11)u^2-(9/11)u=2. A solve question must fill EQ, not CALC; otherwise "
@@ -86,7 +90,14 @@ SYSTEM_EXAM = (
     "expression — do NOT solve or simplify it yourself. Use I for the imaginary "
     "unit and explicit * for multiplication. 'Divide (2+3i) by (4-2i)' is "
     "(2+3*I)/(4-2*I); 'Simplify i^101' is I**101; 'Express sqrt(-4)' is "
-    "sqrt(-4). Use none if the question is not one expression to evaluate>\n"
+    "sqrt(-4); 'Multiply the polynomials (x-1)(x^2-2x+1)' is "
+    "(x-1)*(x**2-2*x+1). Any multiply, expand, simplify, factor or 'which "
+    "expression is equivalent' question is a SYM question, and then copy each "
+    "option into OPTIONS the same way, e.g. A=x**3 - x**2 - x + 1. "
+    "Use none only if the question is not an expression to evaluate>\n"
+    "DIV: <if the question divides one polynomial by another, write "
+    "`dividend ; divisor` as sympy expressions, e.g. "
+    "`2*x**3 + 3*x**2 - 4*x + 15 ; x + 3`; otherwise none>\n"
     "CHECK: <if each option gives values for named quantities, write the "
     "conditions the question states as expressions that equal 0 for the correct "
     "option, separated by ; and using those names — e.g. for 'area 240, base is "
@@ -498,8 +509,10 @@ def _sym_solve_eq(eq_text):
     expr = _safe_sym(eq_text)
     free = list(expr.free_symbols)
     if len(free) != 1:
-        return []
+        return None
     solutions = sympy.solve(sympy.Eq(expr, 0), free[0])
+    # [] means "solved, nothing satisfies it" — distinct from None, which means
+    # "could not attempt". The difference decides whether No Solution is proven.
     return [s for s in solutions if s.is_real is not False]
 
 
@@ -1065,6 +1078,7 @@ def _exam_sample(b64, custom_prompt, temperature):
         "options": options,
         "options_text": _parse_option_text(reply),
         "sym": _line_after(reply, "SYM:").strip(),
+        "div": _line_after(reply, "DIV:").strip(),
         "check": _line_after(reply, "CHECK:").strip(),
         "vars": _line_after(reply, "VARS:").strip(),
         "computed": None,
@@ -1098,6 +1112,59 @@ def _check_options(check_text, vars_text, option_texts):
     return "", ""
 
 
+def _sym_div(div_text):
+    """Exact quotient and remainder. Returns (quotient, remainder) or None."""
+    import sympy
+    parts = [p.strip() for p in (div_text or "").split(";") if p.strip()]
+    if len(parts) != 2:
+        return None
+    dividend, divisor = _safe_sym(parts[0]), _safe_sym(parts[1])
+    symbols = sorted(dividend.free_symbols | divisor.free_symbols, key=str)
+    if not symbols:
+        return None
+    quotient, remainder = sympy.div(dividend, divisor, symbols[0])
+    return quotient, remainder
+
+
+def _option_parts(text):
+    """'Quotient: 2*x**2 - 3*x + 5, Remainder: 15' -> ['2*x**2 - 3*x + 5', '15'].
+    Labels are dropped so the pieces can be compared as expressions."""
+    import re as _re
+    out = []
+    for piece in _re.split(r"[;,]", text or ""):
+        if ":" in piece:
+            piece = piece.split(":", 1)[1]
+        piece = piece.strip()
+        if piece:
+            out.append(piece)
+    return out
+
+
+def _sym_tuple_match(values, option_texts):
+    """An option wins only if every one of its pieces matches, in order."""
+    for key, text in option_texts.items():
+        parts = _option_parts(text)
+        if len(parts) != len(values):
+            continue
+        try:
+            parsed = [_safe_sym(p) for p in parts]
+        except Exception:
+            continue
+        if all(_sym_equal(a, b) for a, b in zip(values, parsed)):
+            return key
+    return ""
+
+
+def _no_solution_option(option_texts):
+    """Which option, if any, says there is no solution."""
+    import re as _re
+    pattern = r"no\s+(real\s+)?solution|no\s+solutions|none\b|empty\s*set|\bDNE\b"
+    for key, text in option_texts.items():
+        if _re.search(pattern, text or "", _re.I):
+            return key
+    return ""
+
+
 def _verify_sample(s):
     """Can Python PROVE this sample? Returns (letter, note, chosen_value) or None.
     Ordered strongest first: exact solution set, exact symbolic value, then the
@@ -1127,17 +1194,35 @@ def _verify_sample(s):
         if pick:
             return pick, f"satisfies the conditions: {shown}", None
 
-    # 2. solve exactly and compare solution sets
+    # 2. polynomial division — the answer is a pair, so match it as one
+    div_text = s.get("div", "")
+    if div_text and div_text.lower() not in ("none", "n/a", "") and option_texts:
+        try:
+            pair = _sym_div(div_text)
+        except Exception:
+            pair = None
+        if pair:
+            pick = _sym_tuple_match(pair, option_texts)
+            if pick:
+                return pick, f"divided exactly: quotient {pair[0]}, remainder {pair[1]}", None
+
+    # 3. solve exactly and compare solution sets
     if eq and eq.lower() not in ("none", "n/a", "") and option_texts:
         try:
             solutions = _sym_solve_eq(eq)
         except Exception:
-            solutions = []
+            solutions = None
         if solutions:
             pick = _sym_set_match(solutions, option_texts)
             if pick:
                 shown = ", ".join(str(v) for v in solutions)
                 return pick, f"solved exactly: {shown}", None
+        elif solutions == []:
+            # Solved, and nothing satisfies it — extraneous roots are exactly
+            # why "No Solution" is an option on radical equations.
+            pick = _no_solution_option(option_texts)
+            if pick:
+                return pick, "no value satisfies the equation", None
 
     # 2. exact symbolic value (complex numbers, radicals, fractions)
     if sym and sym.lower() not in ("none", "n/a", "") and option_texts:
@@ -1192,7 +1277,11 @@ def _exam_answer(b64, custom_prompt=None):
     # match, the OPTIONS line was invented — do not treat the match as proof.
     if proofs:
         named = _why_letter(samples[0]["why"])
-        if named and named != proofs[0][0]:
+        # Only nearest-number matching is second-guessed here. "solved exactly",
+        # "verified symbolically" and "satisfies the conditions" are proofs, not
+        # heuristics, and the model's prose does not outrank them.
+        heuristic = proofs[0][1].startswith("computed")
+        if heuristic and named and named != proofs[0][0]:
             for s in samples:
                 if s["expr"]:
                     try:
