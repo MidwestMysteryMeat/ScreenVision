@@ -506,6 +506,32 @@ def _numbers_in(text):
     return out
 
 
+def _real_domain_ok(expr, var, value):
+    """Is this solution real-domain valid? Every log argument must be positive
+    and every even root non-negative at the candidate.
+
+    Substituting back is not enough. For ln(x^2-4) = ln(3) + ln(x) at x = -1 the
+    residual is exactly zero, because over the complex numbers log(-3) really
+    does equal log(3) + i*pi. The root is extraneous only because the question
+    lives in the reals."""
+    import sympy
+    try:
+        for node in sympy.preorder_traversal(expr):
+            if isinstance(node, sympy.log):
+                arg = complex(sympy.N(node.args[0].subs(var, value)))
+                if abs(arg.imag) > 1e-9 or arg.real <= 1e-12:
+                    return False
+            elif isinstance(node, sympy.Pow):
+                base, power = node.args
+                if getattr(power, "is_Rational", False) and power.q % 2 == 0:
+                    arg = complex(sympy.N(base.subs(var, value)))
+                    if abs(arg.imag) > 1e-9 or arg.real < -1e-12:
+                        return False
+    except Exception:
+        return True          # cannot tell — do not silently drop a solution
+    return True
+
+
 def _sym_solve_eq(eq_text):
     """Solve f(var)=0 exactly. The free symbol is inferred, so no extra contract
     line is needed — the model already writes EQ for solve questions."""
@@ -517,7 +543,8 @@ def _sym_solve_eq(eq_text):
     solutions = sympy.solve(sympy.Eq(expr, 0), free[0])
     # [] means "solved, nothing satisfies it" — distinct from None, which means
     # "could not attempt". The difference decides whether No Solution is proven.
-    return [s for s in solutions if s.is_real is not False]
+    return [s for s in solutions
+            if s.is_real is not False and _real_domain_ok(expr, free[0], s)]
 
 
 def _sym_set_match(solutions, option_texts):
@@ -597,7 +624,7 @@ def _parse_exam_spec(text):
 # ── Cross-check: independent second opinion for unverified answers ──────────
 # GPU1 (the 16GB V100) is otherwise idle, and Ollama keeps two models resident
 # (OLLAMA_MAX_LOADED_MODELS=2), so the checker sits alongside the main VLM.
-CHECK_MODEL = os.environ.get("SCREENVISION_CHECK_MODEL", "gemma3:12b")
+CHECK_MODEL = os.environ.get("SCREENVISION_CHECK_MODEL", "gemma4:12b")
 # Second Ollama instance pinned to GPU1 (ollama-gpu1.service). Keeping the
 # checker on its own card means the two models never compete for VRAM.
 CHECK_URL = os.environ.get("SCREENVISION_CHECK_URL", "http://127.0.0.1:11435")
@@ -625,14 +652,19 @@ def set_crosscheck(enabled):
     return f"Cross-check: {'on (' + CHECK_MODEL + ')' if _CROSSCHECK else 'off'}"
 
 
-def _ask_model(model, system, b64, prompt, num_predict=8, timeout=240, base=None):
-    body = json.dumps({
+def _ask_model(model, system, b64, prompt, num_predict=8, timeout=240, base=None,
+               think=None):
+    payload = {
         "model": model,
         "messages": [{"role": "system", "content": system},
                      {"role": "user", "content": prompt, "images": [b64]}],
         "stream": False,
         "options": {"num_ctx": 4096, "num_predict": num_predict, "temperature": 0},
-    }).encode()
+    }
+    if think is not None:
+        # Only reasoning models accept this, and only the checker is one.
+        payload["think"] = think
+    body = json.dumps(payload).encode()
     req = urllib.request.Request(f"{base or OLLAMA}/api/chat", data=body,
                                  headers={"Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -681,7 +713,7 @@ def _cross_check(b64, letter):
     try:
         raw = _ask_model(CHECK_MODEL, SYSTEM_CHECK, b64,
                          "Which option is correct? Reply with the letter only.",
-                         base=CHECK_URL)
+                         base=CHECK_URL, think=False)
     except Exception as e:
         return "", f"[cross-check unavailable: {type(e).__name__}]", ""
     other = _first_letter(raw)
