@@ -95,6 +95,15 @@ SYSTEM_EXAM = (
     "expression is equivalent' question is a SYM question, and then copy each "
     "option into OPTIONS the same way, e.g. A=x**3 - x**2 - x + 1. "
     "Use none only if the question is not an expression to evaluate>\n"
+    "GRAPH: <if the options are PICTURES of graphs, copy the function being "
+    "graphed as a sympy expression in x — log base b is log(arg, b), so "
+    "log_3(x-1)+1 is `log(x-1, 3) + 1`, and 2^(x+3)-4 is `2**(x+3) - 4`; "
+    "otherwise none>\n"
+    "FIT: <if the question asks which function or model fits stated data, list "
+    "the data points as `input -> output` separated by ; e.g. "
+    "`0 -> 10; 4 -> 100000` for 'started at 10 in 2016, reached 100000 in 2020', "
+    "and copy each option into OPTIONS as a sympy expression in t, e.g. "
+    "A=10*(6.3096)**t; B=10*10**t. Otherwise none>\n"
     "VERTEX: <if the question asks for the vertex, maximum, minimum or turning "
     "point of a quadratic, copy the quadratic itself as a sympy expression in x, "
     "e.g. `2*x**2 - 3*x - 7` — do not compute the vertex yourself; "
@@ -1101,6 +1110,164 @@ def _map_computed_to_option(b64, val, expr):
     return _first_letter(_line_after(reply, "ANSWER:")), _line_after(reply, "WHY:").strip()
 
 
+SYSTEM_GRAPHPICK = (
+    "You are matching a curve to a description that has already been computed "
+    "and is correct. Do not recompute it. Look at the lettered graphs on screen "
+    "and choose the one matching ALL of it — the vertical asymptote position "
+    "matters most, then the marked points.\n"
+    "Reply with exactly two lines:\n"
+    "ANSWER: <letter>\n"
+    "WHY: <one sentence, 20 words maximum>"
+)
+
+
+SYSTEM_GRAPHREAD = (
+    "Each lettered panel on screen shows one curve. For EVERY letter, report "
+    "where that curve's vertical asymptote is — the vertical line the curve "
+    "approaches but never crosses — as an x-value, or the word none if that "
+    "panel has no vertical asymptote.\n"
+    "Reply with one line per panel and nothing else:\n"
+    "A: <x-value or none>\n"
+    "B: <x-value or none>\n"
+    "C: <x-value or none>\n"
+    "D: <x-value or none>"
+)
+
+
+def _asymptote_of(expr_text):
+    """The single vertical asymptote of the graphed function, or None."""
+    import sympy
+    expr = _safe_sym(expr_text)
+    free = list(expr.free_symbols)
+    if len(free) != 1:
+        return None
+    var = free[0]
+    edges = []
+    try:
+        edges = [p for p in sympy.calculus.singularities(expr, var, sympy.S.Reals)
+                 if p.is_real and p.is_finite]
+    except Exception:
+        pass
+    if not edges:
+        try:
+            from sympy.calculus.util import continuous_domain
+            domain = continuous_domain(expr, var, sympy.S.Reals)
+            if isinstance(domain, sympy.Interval):
+                if domain.start.is_finite and domain.left_open:
+                    edges.append(domain.start)
+                if domain.end.is_finite and domain.right_open:
+                    edges.append(domain.end)
+        except Exception:
+            return None
+    if len(set(edges)) != 1:
+        return None
+    return float(list(set(edges))[0])
+
+
+def _graph_pick_by_asymptote(b64, target):
+    """Ask each panel where its asymptote is; Python does the matching."""
+    import re as _re
+    try:
+        reply = _ask_model(MODEL, SYSTEM_GRAPHREAD, b64,
+                           "Report each panel's vertical asymptote.", num_predict=120)
+    except Exception:
+        return "", ""
+    readings = {}
+    for line in (reply or "").splitlines():
+        m = _re.match(r"\s*([A-Z])\s*[:.)]\s*(.+)", line.strip())
+        if not m:
+            continue
+        letter, value = m.group(1).upper(), m.group(2).strip()
+        number = _re.search(r"-?\d+(?:\.\d+)?", value)
+        readings[letter] = float(number.group()) if number else None
+    matches = [k for k, v in readings.items() if v is not None and abs(v - target) < 0.3]
+    shown = ", ".join(f"{k}={'none' if v is None else v:g}" if v is not None else f"{k}=none"
+                      for k, v in sorted(readings.items()))
+    if len(matches) == 1:
+        return matches[0], shown
+    return "", shown
+
+
+def _graph_features(expr_text):
+    """The few facts that identify a curve: where it is undefined, where it
+    crosses the axes, and points it passes through."""
+    import sympy
+    from sympy.calculus.util import continuous_domain
+    expr = _safe_sym(expr_text)
+    free = list(expr.free_symbols)
+    if len(free) != 1:
+        return ""
+    var = free[0]
+    parts = []
+
+    edges = []
+    try:
+        # Poles: 1/(x-2) has its domain as a Union, so Interval edges alone
+        # would report nothing.
+        found = sympy.calculus.singularities(expr, var, sympy.S.Reals)
+        edges = [p for p in found if p.is_real and p.is_finite]
+    except Exception:
+        pass
+    try:
+        domain = continuous_domain(expr, var, sympy.S.Reals)
+        if isinstance(domain, sympy.Interval):
+            if domain.start.is_finite and domain.left_open:
+                edges.append(domain.start)
+            if domain.end.is_finite and domain.right_open:
+                edges.append(domain.end)
+    except Exception:
+        domain = sympy.S.Reals
+    edges = sorted(set(edges), key=str)
+    if edges:
+        parts.append("a vertical asymptote at " +
+                     " and ".join(f"{var}={e}" for e in edges))
+
+    try:
+        roots = [r for r in sympy.solve(sympy.Eq(expr, 0), var)
+                 if r.is_real and _real_domain_ok(expr, var, r)]
+        if roots:
+            parts.append("crosses the x-axis at " +
+                         ", ".join(f"{var}={r} (about {float(r):.2f})" for r in roots[:3]))
+    except Exception:
+        pass
+
+    samples = []
+    for candidate in (0, 1, 2, 3, 4, 10, sympy.Rational(3, 2), -1, -2, sympy.Rational(1, 2)):
+        if len(samples) >= 3:
+            break
+        try:
+            value = complex(sympy.N(expr.subs(var, candidate)))
+        except Exception:
+            continue
+        # nan defeats every comparison, so it must be rejected by name — it was
+        # slipping into the sample list and inverting the rise/fall verdict.
+        import math as _math
+        if not _math.isfinite(value.real) or not _math.isfinite(value.imag):
+            continue
+        if abs(value.imag) > 1e-9 or abs(value.real) > 1e6:
+            continue
+        samples.append((candidate, value.real))
+    if samples:
+        parts.append("passes through " +
+                     ", ".join(f"({c}, {v:g})" for c, v in samples))
+
+    if len(samples) >= 2:
+        rising = samples[-1][1] > samples[0][1]
+        parts.append("rising to the right" if rising else "falling to the right")
+    return "; ".join(parts)
+
+
+def _graph_pick(b64, features):
+    """Ask only which picture matches the computed landmarks."""
+    prompt = (f"The correct graph has: {features}. "
+              f"Which lettered graph on screen is it?")
+    try:
+        reply = _ask_model(MODEL, SYSTEM_GRAPHPICK, b64, prompt, num_predict=90)
+    except Exception:
+        return "", ""
+    return _first_letter(_line_after(reply, "ANSWER:")), _line_after(reply, "WHY:").strip()
+
+
 def _exam_sample(b64, custom_prompt, temperature):
     """One full read of the screen, parsed into the exam contract."""
     reply = _ask_blocking(b64, "Exam", custom_prompt, temperature=temperature)
@@ -1114,6 +1281,8 @@ def _exam_sample(b64, custom_prompt, temperature):
         "options": options,
         "options_text": _parse_option_text(reply),
         "sym": _line_after(reply, "SYM:").strip(),
+        "graph": _line_after(reply, "GRAPH:").strip(),
+        "fit": _line_after(reply, "FIT:").strip(),
         "vertex": _line_after(reply, "VERTEX:").strip(),
         "div": _line_after(reply, "DIV:").strip(),
         "check": _line_after(reply, "CHECK:").strip(),
@@ -1221,6 +1390,47 @@ def _sym_vertex(expr_text):
     return h, k
 
 
+def _fit_match(fit_text, option_texts):
+    """Which option reproduces every stated data point. Rounded coefficients are
+    expected in these options, so the comparison is relative, not exact."""
+    import sympy
+    points = []
+    for part in (fit_text or "").split(";"):
+        if "->" not in part:
+            continue
+        left, right = part.split("->", 1)
+        try:
+            points.append((_safe_sym(left.strip()), _safe_sym(right.strip())))
+        except Exception:
+            return ""
+    if not points:
+        return ""
+    winners = []
+    for key, text in option_texts.items():
+        try:
+            expr = _safe_sym(text)
+        except Exception:
+            continue
+        free = list(expr.free_symbols)
+        if len(free) != 1:
+            continue
+        var = free[0]
+        try:
+            ok = True
+            for x, y in points:
+                got = complex(sympy.N(expr.subs(var, x)))
+                want = complex(sympy.N(y))
+                scale = max(1.0, abs(want))
+                if abs(got - want) > scale * 1e-3:
+                    ok = False
+                    break
+        except Exception:
+            continue
+        if ok:
+            winners.append(key)
+    return winners[0] if len(winners) == 1 else ""
+
+
 def _verify_sample(s):
     """Can Python PROVE this sample? Returns (letter, note, chosen_value) or None.
     Ordered strongest first: exact solution set, exact symbolic value, then the
@@ -1250,7 +1460,17 @@ def _verify_sample(s):
         if pick:
             return pick, f"satisfies the conditions: {shown}", None
 
-    # 2. vertex / turning point — options are pairs, sometimes just the value
+    # 2. a function that must reproduce the stated data points
+    fit_text = s.get("fit", "")
+    if fit_text and fit_text.lower() not in ("none", "n/a", "") and option_texts:
+        try:
+            pick = _fit_match(fit_text, option_texts)
+        except Exception:
+            pick = ""
+        if pick:
+            return pick, f"reproduces the data: {fit_text}", None
+
+    # 3. vertex / turning point — options are pairs, sometimes just the value
     vertex_text = s.get("vertex", "")
     if vertex_text and vertex_text.lower() not in ("none", "n/a", "") and option_texts:
         try:
@@ -1314,7 +1534,12 @@ def _verify_sample(s):
         else:
             if options and not multi:
                 closest = min(options, key=lambda k: abs(options[k] - val))
-                return closest, f"computed {val:g}", options[closest]
+                gap = abs(options[closest] - val)
+                # Rounded options are normal (99.54 shown as 100). A value that
+                # answers a different question is not, and min() cannot tell the
+                # difference on its own.
+                if gap <= max(0.02 * abs(options[closest]), 0.02):
+                    return closest, f"computed {val:g}", options[closest]
             s["computed"] = (val, expr)
             return None
 
@@ -1418,6 +1643,35 @@ def _exam_answer(b64, custom_prompt=None):
         _pick, residual = _solve_by_substitution(eq, options)
         if residual is not None:
             calc_note = "[no option satisfies the equation]"
+
+    # Graphs: nothing textual to verify, but the curve's landmarks are
+    # computable, and matching two landmarks beats comparing four curves.
+    graph_text = samples[0].get("graph", "")
+    if graph_text and graph_text.lower() not in ("none", "n/a", ""):
+        try:
+            features = _graph_features(graph_text)
+        except Exception:
+            features = ""
+        if features:
+            # Preferred: one perceptual reading per panel, matched in code.
+            try:
+                target = _asymptote_of(graph_text)
+            except Exception:
+                target = None
+            readings = ""
+            pick = ""
+            if target is not None:
+                pick, readings = _graph_pick_by_asymptote(b64, target)
+            if not pick:
+                pick, _graph_why = _graph_pick(b64, features)
+            # The landmarks are computed and reliable; the letter is not.
+            # Lead with what can be trusted so it can be matched by eye.
+            text = "GRAPH — match these by eye:\n" + features
+            if pick:
+                text += f"\n\nmodel guessed {pick} (unreliable on plots — verify)"
+            if readings:
+                text += f"\npanels read as {readings}"
+            return text
 
     # Nothing was verified by Python — this is where a second opinion earns its
     # time, and the only place it is spent.
