@@ -127,10 +127,63 @@ class ScreenVisionTests(unittest.TestCase):
             return "ANSWER: B\nCALC: none\nOPTIONS: none\n"
 
         with mock.patch.object(screen_vision, "_ask_blocking", fake_ask), \
-                mock.patch.object(screen_vision, "_RESEARCH", "Off"):
+                mock.patch.object(screen_vision, "_RESEARCH", "Off"), \
+                mock.patch.object(screen_vision, "_CROSSCHECK", False):
             out = screen_vision._exam_answer("fake-b64")
         self.assertEqual(calls, ["Exam"])
         self.assertEqual(out, "B")
+
+    def test_verified_math_never_pays_for_a_cross_check(self):
+        """A computed answer is already deterministic — no second opinion."""
+        checked = []
+
+        def fake_ask(_b64, _mode, _prompt=None):
+            return ("ANSWER: C\nCALC: 10*log10(9e-3/1e-12)\n"
+                    "OPTIONS: A=-2; B=10; C=229.2; D=100\n")
+
+        with mock.patch.object(screen_vision, "_ask_blocking", fake_ask), \
+                mock.patch.object(screen_vision, "_CROSSCHECK", True), \
+                mock.patch.object(screen_vision, "_ask_model",
+                                  lambda *a, **k: checked.append(1) or "D"):
+            out = screen_vision._exam_answer("fake-b64")
+        self.assertEqual(checked, [])
+        self.assertTrue(out.startswith("D."), out)
+
+    def test_cross_check_reconciles_a_disagreement(self):
+        """Disagreement must end in a decision, not a shrug."""
+        def fake_ask(_b64, _mode, _prompt=None):
+            return "ANSWER: B\nCALC: none\nEQ: none\nOPTIONS: A=1; B=2; C=3\n"
+
+        def fake_model(model, system, _b64, _prompt, **_kw):
+            if "checking" in system:
+                return "C"                      # the independent model disagrees
+            return "FINAL: C\nWHY: The exponents must be equal."
+
+        with mock.patch.object(screen_vision, "_ask_blocking", fake_ask), \
+                mock.patch.object(screen_vision, "_RESEARCH", "Off"), \
+                mock.patch.object(screen_vision, "_CROSSCHECK", True), \
+                mock.patch.object(screen_vision, "_ask_model", fake_model):
+            out = screen_vision._exam_answer("fake-b64")
+        self.assertTrue(out.startswith("C"), out)
+        self.assertIn("changed to C", out)
+
+    def test_cross_check_agreement_is_reported_without_a_third_call(self):
+        calls = []
+
+        def fake_ask(_b64, _mode, _prompt=None):
+            return "ANSWER: B\nCALC: none\nEQ: none\nOPTIONS: A=1; B=2; C=3\n"
+
+        def fake_model(_model, _system, _b64, _prompt, **_kw):
+            calls.append(1)
+            return "B"
+
+        with mock.patch.object(screen_vision, "_ask_blocking", fake_ask), \
+                mock.patch.object(screen_vision, "_RESEARCH", "Off"), \
+                mock.patch.object(screen_vision, "_CROSSCHECK", True), \
+                mock.patch.object(screen_vision, "_ask_model", fake_model):
+            out = screen_vision._exam_answer("fake-b64")
+        self.assertEqual(len(calls), 1)
+        self.assertIn("confirmed by", out)
 
     def test_research_cites_its_source_when_evidence_supports_an_option(self):
         def fake_ask(_b64, mode, _prompt=None):

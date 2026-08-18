@@ -72,13 +72,17 @@ def set_monitor(m):
 
 SYSTEM_EXAM = (
     "You extract a question from the screenshot so a calculator can solve it.\n"
-    "CRITICAL: Do NOT explain. Do NOT show working. Do NOT write any text "
-    "before 'ANSWER:'. Reply with ONLY these three lines, in this exact order:\n"
+    "CRITICAL: Do NOT show working. Do NOT write any text before 'ANSWER:'. "
+    "Reply with ONLY these five lines, in this exact order:\n"
     "ANSWER: <letter for multiple choice, or a short numeric answer>\n"
     "CALC: <one Python expression that evaluates to the numeric result, "
     "or the word none if it is not a calculation>\n"
+    "EQ: <if the question asks you to solve for a variable, rewrite it as one "
+    "Python expression in x that equals 0 at the correct x — move every term to "
+    "one side, e.g. `2**(3*x-1) - 16**x` for 2^(3x-1)=16^x; otherwise none>\n"
     "OPTIONS: <letter=number pairs separated by ; e.g. A=-2; B=10; C=229.2; D=100, "
-    "strip $ and commas; or the word none>\n"
+    "strip $ and commas, write fractions as decimals; or the word none>\n"
+    "WHY: <one sentence, 20 words maximum, saying how the answer follows>\n"
     "CALC rules: use ** for powers, log10 for common/decibel log, log for ln, "
     "log2, exp, sqrt, sin, cos, tan, pi, e. "
     "Compound interest is P*(1+r/n)**(n*t). "
@@ -300,8 +304,9 @@ def _safe_pow(base, exp):
     return float(base) ** float(exp)
 
 
-def _safe_calc_eval(expr):
-    """Scalar sandbox — the VLM must not do the arithmetic itself."""
+def _safe_calc_eval(expr, variables=None):
+    """Scalar sandbox — the VLM must not do the arithmetic itself.
+    `variables` binds names like x so an equation can be tested at a value."""
     if not isinstance(expr, str) or not expr.strip():
         raise ValueError("empty calc")
     expr = expr.strip().rstrip(".")
@@ -314,6 +319,8 @@ def _safe_calc_eval(expr):
     if sum(1 for _ in ast.walk(tree)) > 80:
         raise ValueError("calc too complex")
     ns = _calc_ns()
+    names = dict(ns)
+    names.update(variables or {})
     binary_ops = {
         ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
         ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv,
@@ -331,8 +338,8 @@ def _safe_calc_eval(expr):
                 raise ValueError("only numeric constants")
             return node.value
         if isinstance(node, ast.Name):
-            if node.id in ns and not callable(ns[node.id]):
-                return ns[node.id]
+            if node.id in names and not callable(names[node.id]):
+                return names[node.id]
             raise ValueError(f"unknown name: {node.id}")
         if isinstance(node, ast.UnaryOp) and type(node.op) in unary_ops:
             return unary_ops[type(node.op)](evaluate(node.operand, depth + 1))
@@ -391,6 +398,94 @@ def _parse_exam_spec(text):
                 except ValueError:
                     pass
     return letter, expr, options
+
+
+# ── Cross-check: independent second opinion for unverified answers ──────────
+# GPU1 (the 16GB V100) is otherwise idle, and Ollama keeps two models resident
+# (OLLAMA_MAX_LOADED_MODELS=2), so the checker sits alongside the main VLM.
+CHECK_MODEL = os.environ.get("SCREENVISION_CHECK_MODEL", "gemma3:12b")
+_CROSSCHECK = True
+
+SYSTEM_CHECK = (
+    "You are checking a multiple-choice question. Work it out yourself and reply "
+    "with ONLY the letter of the correct option — one character, no words, no "
+    "punctuation, no explanation."
+)
+
+SYSTEM_RECONCILE = (
+    "Two models proposed different answers to the multiple-choice question on "
+    "screen. Work the question out again and decide which is right; you may "
+    "conclude both are wrong and pick a third option.\n"
+    "Reply with exactly two lines:\n"
+    "FINAL: <letter>\n"
+    "WHY: <one sentence, 20 words maximum>"
+)
+
+
+def set_crosscheck(enabled):
+    global _CROSSCHECK
+    _CROSSCHECK = bool(enabled)
+    return f"Cross-check: {'on (' + CHECK_MODEL + ')' if _CROSSCHECK else 'off'}"
+
+
+def _ask_model(model, system, b64, prompt, num_predict=8, timeout=240):
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "system", "content": system},
+                     {"role": "user", "content": prompt, "images": [b64]}],
+        "stream": False,
+        "options": {"num_ctx": 4096, "num_predict": num_predict, "temperature": 0},
+    }).encode()
+    req = urllib.request.Request(f"{OLLAMA}/api/chat", data=body,
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode()).get("message", {}).get("content", "") or ""
+
+
+def _first_letter(text):
+    return next((c.upper() for c in (text or "") if c.isalpha()), "")
+
+
+def _reconcile(b64, mine, other):
+    """Both candidates back to the main model for a decision."""
+    prompt = (f"One model answered {mine}. Another answered {other}. "
+              f"Which option is actually correct?")
+    try:
+        reply = _ask_model(MODEL, SYSTEM_RECONCILE, b64, prompt, num_predict=90)
+    except Exception:
+        return "", ""
+    final = _first_letter(_line_after(reply, "FINAL:"))
+    why = _line_after(reply, "WHY:").strip()
+    return final, why
+
+
+def _cross_check(b64, letter):
+    """Returns (final_letter, note). final_letter is "" when nothing changed."""
+    if not _CROSSCHECK or not letter:
+        return "", ""
+    mine = letter.strip()[:1].upper()
+    if not mine.isalpha():
+        return "", ""
+    short = CHECK_MODEL.split(":")[0]
+    try:
+        raw = _ask_model(CHECK_MODEL, SYSTEM_CHECK, b64,
+                         "Which option is correct? Reply with the letter only.")
+    except Exception as e:
+        return "", f"[cross-check unavailable: {type(e).__name__}]"
+    other = _first_letter(raw)
+    if not other:
+        return "", ""
+    if other == mine:
+        return "", f"\u2713 confirmed by {short}"
+    final, why = _reconcile(b64, mine, other)
+    if not final:
+        return "", f"\u26a0 {short} says {other} \u2014 unresolved, check this one"
+    tail = f" \u2014 {why}" if why else ""
+    if final == mine:
+        return "", f"\u2713 {short} said {other}; re-checked, {mine} stands{tail}"
+    if final == other:
+        return final, f"\u21bb changed to {final} \u2014 {short} caught it{tail}"
+    return final, f"\u21bb changed to {final} (was {mine}, {short} said {other}){tail}"
 
 
 # ── Research: optional retrieval for non-math questions ──────────────────────
@@ -663,27 +758,111 @@ def _research_answer(b64, letter, fallback_text):
     return out
 
 
+def _solve_by_substitution(eq_expr, options):
+    """Multiple choice turns solving into checking. Returns (letter, residual)
+    only when one option genuinely satisfies the equation — a merely least-bad
+    option is rejected, so a bad EQ line degrades to "no answer" rather than to
+    a confident wrong letter."""
+    scored = []
+    for key, value in options.items():
+        try:
+            scored.append((abs(_safe_calc_eval(eq_expr, {"x": value})), key))
+        except Exception:
+            continue
+    if not scored:
+        return None, None
+    scored.sort()
+    best_res, best_key = scored[0]
+    if best_res <= 1e-6:
+        return best_key, best_res
+    # or an unambiguous winner: orders of magnitude closer than anything else
+    if len(scored) > 1 and best_res < scored[1][0] * 1e-6:
+        return best_key, best_res
+    return None, best_res
+
+
+def _clean_why(why, chosen=None, options=None):
+    """One sentence, capped — and dropped outright if it contradicts the
+    verified answer. The letter is checked by Python; this line never is."""
+    import re as _re
+    text = (why or "").strip()
+    if not text or text.lower() in ("none", "n/a"):
+        return ""
+    for sep in (". ", "? ", "! "):
+        if sep in text:
+            text = text.split(sep)[0].rstrip(" ,;—-") + "."
+            break
+    if len(text) > 170:
+        text = text[:170].rsplit(" ", 1)[0] + "…"
+    if options and chosen is not None:
+        for tok in _re.findall(r"-?\d[\d,]*\.?\d*", text):
+            try:
+                num = float(tok.replace(",", ""))
+            except ValueError:
+                continue
+            # bare small integers are algebra coefficients, not answer values
+            if "." not in tok and abs(num) < 10:
+                continue
+            if abs(num - chosen) <= max(0.01, abs(chosen) * 0.01):
+                continue
+            for value in options.values():
+                if value != chosen and abs(num - value) <= max(0.01, abs(value) * 0.01):
+                    return ""
+    return text
+
+
 def _exam_answer(b64, custom_prompt=None):
-    """VLM reads the screen; Python computes. Calculator wins ties vs the letter.
-    Non-math questions fall through to Research only if a backend is selected —
-    the math path stays exactly one model call."""
+    """VLM reads the screen; Python decides. Three routes, most reliable first:
+    compute the expression, verify options against the equation, or (opt-in)
+    look the answer up. The model's own letter is the last resort, and is
+    labelled as such."""
     reply = _ask_blocking(b64, "Exam", custom_prompt)
     letter, expr, options = _parse_exam_spec(reply)
-    if not expr or expr.lower() in ("none", "n/a", ""):
-        if _RESEARCH != "Off":
-            return _research_answer(b64, letter, reply)
-        return letter or reply
-    try:
-        val = _safe_calc_eval(expr)
-    except Exception as e:
-        return (letter or reply) + f"\n[calc failed: {e}]"
-    if options:
-        closest = min(options, key=lambda k: abs(options[k] - val))
-        shown = options[closest]
-        return f"{closest}. {shown:g}\ncomputed {val:g}"
-    if letter:
-        return f"{letter}\ncomputed {val:g}"
-    return f"{val:g}"
+    eq = _line_after(reply, "EQ:")
+    why = _line_after(reply, "WHY:")
+
+    def out(body, note="", chosen=None):
+        text = body
+        if note:
+            text += "\n" + note
+        explanation = _clean_why(why, chosen, options)
+        if explanation:
+            text += "\n" + explanation
+        return text
+
+    calc_note = ""
+    if expr and expr.lower() not in ("none", "n/a", ""):
+        try:
+            val = _safe_calc_eval(expr)
+        except Exception as e:
+            calc_note = f"[calc failed: {e}]"
+        else:
+            if options:
+                closest = min(options, key=lambda k: abs(options[k] - val))
+                return out(f"{closest}. {options[closest]:g}", f"computed {val:g}",
+                           options[closest])
+            if letter:
+                return out(letter, f"computed {val:g}")
+            return out(f"{val:g}")
+
+    # "Solve for x" — check each option against the equation instead of solving.
+    if eq and eq.lower() not in ("none", "n/a", "") and options:
+        pick, residual = _solve_by_substitution(eq, options)
+        if pick:
+            return out(f"{pick}. {options[pick]:g}", "verified by substitution",
+                       options[pick])
+        if residual is not None:
+            calc_note = calc_note or "[no option satisfies the equation]"
+
+    # Nothing was verified by Python — this is where a second opinion earns its
+    # time, and the only place it is spent.
+    final_letter, second = _cross_check(b64, letter)
+    note = "\n".join(x for x in (calc_note, second) if x)
+    if _RESEARCH != "Off":
+        return out(_research_answer(b64, letter, reply), note)
+    body = final_letter or letter or reply
+    chosen = options.get(body.strip()[:1].upper()) if (options and body) else None
+    return out(body, note, chosen)
 
 
 # ── Graph mode: derive the equation, plot the correct graph ───────────────────
@@ -1115,6 +1294,9 @@ with gr.Blocks(title="Screen Vision", head=HEAD_JS) as demo:
                                      value=_MONITOR, label="Monitor (which screen to capture)")
             research_dd = gr.Dropdown(choices=RESEARCH_MODES, value=_RESEARCH,
                                       label="Research (non-math only — adds ~10s when on)")
+            crosscheck_cb = gr.Checkbox(
+                value=_CROSSCHECK,
+                label=f"Cross-check unverified answers with {CHECK_MODEL}")
             btn_cap = gr.Button("CAPTURE", variant="primary")
             btn_ask = gr.Button("SEND", variant="primary")
             gr.Markdown(
@@ -1152,6 +1334,7 @@ with gr.Blocks(title="Screen Vision", head=HEAD_JS) as demo:
             btn_gpu_unload.click(gpu_unload, outputs=gpu_state_box)
             monitor_dd.change(set_monitor, inputs=monitor_dd, outputs=status)
             research_dd.change(set_research, inputs=research_dd, outputs=status)
+            crosscheck_cb.change(set_crosscheck, inputs=crosscheck_cb, outputs=status)
             mode_radio.change(lambda m: gr.update(visible=(m == "Graph")),
                               inputs=mode_radio, outputs=graph_out)
 
