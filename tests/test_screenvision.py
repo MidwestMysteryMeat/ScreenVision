@@ -82,6 +82,28 @@ class ScreenVisionTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     screen_vision._safe_expr_eval(expression, np.array([1.0]))
 
+    def test_calc_eval_matches_decibel_and_compound_interest(self):
+        db = screen_vision._safe_calc_eval("10*log10(9e-3/1e-12)")
+        self.assertAlmostEqual(db, 99.54242509439325, places=6)
+        cd = screen_vision._safe_calc_eval("2500*(1+0.045/4)**(4*4)")
+        self.assertAlmostEqual(cd, 2990.037, places=2)
+
+    def test_exam_parser_calculator_overrides_wrong_letter(self):
+        reply = (
+            "ANSWER: C\n"
+            "CALC: 10*log10(9e-3/1e-12)\n"
+            "OPTIONS: A=-2; B=10; C=229.2; D=100\n"
+        )
+        letter, expr, options = screen_vision._parse_exam_spec(reply)
+        self.assertEqual(letter, "C")
+        val = screen_vision._safe_calc_eval(expr)
+        closest = min(options, key=lambda k: abs(options[k] - val))
+        self.assertEqual(closest, "D")
+
+    def test_calc_eval_rejects_imports(self):
+        with self.assertRaises(ValueError):
+            screen_vision._safe_calc_eval("__import__('os').system('whoami')")
+
 
 if __name__ == "__main__":
     unittest.main()

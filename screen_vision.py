@@ -71,9 +71,24 @@ def set_monitor(m):
     return f"Monitor: {m}"
 
 SYSTEM_EXAM = (
-    "You are a fast, direct assistant. Be extremely brief. "
-    "For multiple choice: state the letter only, then one short sentence why. "
-    "For other questions: answer in 1-2 sentences max. No preamble, no filler."
+    "You extract a question from the screenshot so a calculator can solve it.\n"
+    "CRITICAL: Do NOT explain. Do NOT show working. Do NOT write any text "
+    "before 'ANSWER:'. Reply with ONLY these three lines, in this exact order:\n"
+    "ANSWER: <letter for multiple choice, or a short numeric answer>\n"
+    "CALC: <one Python expression that evaluates to the numeric result, "
+    "or the word none if it is not a calculation>\n"
+    "OPTIONS: <letter=number pairs separated by ; e.g. A=-2; B=10; C=229.2; D=100, "
+    "strip $ and commas; or the word none>\n"
+    "CALC rules: use ** for powers, log10 for common/decibel log, log for ln, "
+    "log2, exp, sqrt, sin, cos, tan, pi, e. "
+    "Compound interest is P*(1+r/n)**(n*t). "
+    "Half-life: remaining fraction f, t = half*log(f)/log(0.5). "
+    "Decibels D=10 log(I/I0) means 10*log10(I/I0)."
+)
+
+PROMPT_EXAM = (
+    "Read the on-screen question. Output ANSWER / CALC / OPTIONS only. "
+    "Start your reply with ANSWER:"
 )
 
 SYSTEM_BUSINESS = (
@@ -169,8 +184,8 @@ def _build_request(b64, mode, custom_prompt=None, stream=True):
         num_predict = 500
     else:
         system = SYSTEM_EXAM
-        prompt = custom_prompt or "If a question or multiple-choice problem is visible, answer it directly — state the letter first. Otherwise briefly describe what you see."
-        num_predict = 400
+        prompt = custom_prompt or PROMPT_EXAM
+        num_predict = 220
 
     return json.dumps({
         "model": MODEL,
@@ -231,6 +246,8 @@ def ask(question, mode):
         if mode == "Graph":
             text, img = _graph_answer(b64, question.strip() or None)
             yield text, img
+        elif mode == "Exam":
+            yield _exam_answer(b64, question.strip() or None), None
         else:
             yield _ask_blocking(b64, mode, question.strip() or None), None
     except Exception as e:
@@ -248,6 +265,147 @@ def _ask_blocking(b64, mode, custom_prompt=None):
     with urllib.request.urlopen(req, timeout=120) as r:
         content = json.loads(r.read().decode()).get("message", {}).get("content", "")
     return content or "[No answer generated]"
+
+
+# ── Exam mode: model extracts the expression, Python is the calculator ────────
+_CALC_NS = None
+
+
+def _calc_ns():
+    import math
+    global _CALC_NS
+    if _CALC_NS is None:
+        _CALC_NS = {k: getattr(math, k) for k in (
+            "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh",
+            "sqrt", "exp", "log", "log10", "log2", "fabs", "floor", "ceil",
+            "pi", "e", "pow")}
+        _CALC_NS["abs"] = abs
+        _CALC_NS["ln"] = math.log
+        _CALC_NS["round"] = round
+        _CALC_NS["min"] = min
+        _CALC_NS["max"] = max
+    return _CALC_NS
+
+
+def _safe_pow(base, exp):
+    """Bounded exponentiation. `9**9**9` passes every node/depth/length
+    check and then hangs the worker building a 370-million-digit int.
+    Floats overflow instead, which the caller already reports."""
+    if abs(exp) > 1e4:
+        raise ValueError("exponent too large")
+    return float(base) ** float(exp)
+
+
+def _safe_calc_eval(expr):
+    """Scalar sandbox — the VLM must not do the arithmetic itself."""
+    if not isinstance(expr, str) or not expr.strip():
+        raise ValueError("empty calc")
+    expr = expr.strip().rstrip(".")
+    if len(expr) > 400:
+        raise ValueError("calc too long")
+    try:
+        tree = ast.parse(expr.replace("^", "**"), mode="eval")
+    except SyntaxError as exc:
+        raise ValueError("invalid calc expression") from exc
+    if sum(1 for _ in ast.walk(tree)) > 80:
+        raise ValueError("calc too complex")
+    ns = _calc_ns()
+    binary_ops = {
+        ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+        ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv,
+        ast.Mod: operator.mod, ast.Pow: _safe_pow,
+    }
+    unary_ops = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+
+    def evaluate(node, depth=0):
+        if depth > 20:
+            raise ValueError("calc too deep")
+        if isinstance(node, ast.Expression):
+            return evaluate(node.body, depth + 1)
+        if isinstance(node, ast.Constant):
+            if type(node.value) not in (int, float):
+                raise ValueError("only numeric constants")
+            return node.value
+        if isinstance(node, ast.Name):
+            if node.id in ns and not callable(ns[node.id]):
+                return ns[node.id]
+            raise ValueError(f"unknown name: {node.id}")
+        if isinstance(node, ast.UnaryOp) and type(node.op) in unary_ops:
+            return unary_ops[type(node.op)](evaluate(node.operand, depth + 1))
+        if isinstance(node, ast.BinOp) and type(node.op) in binary_ops:
+            return binary_ops[type(node.op)](
+                evaluate(node.left, depth + 1), evaluate(node.right, depth + 1))
+        if isinstance(node, ast.Call):
+            # The model writes both `log10(x)` and `math.log10(x)`; accept
+            # either, and say which name failed so a refusal is debuggable.
+            if isinstance(node.func, ast.Name):
+                fname = node.func.id
+            elif (isinstance(node.func, ast.Attribute)
+                  and isinstance(node.func.value, ast.Name)
+                  and node.func.value.id in ("math", "np", "numpy")):
+                fname = node.func.attr
+            else:
+                raise ValueError("unsupported function reference")
+            if fname not in ns:
+                raise ValueError("function not allowed: %s" % fname)
+            fn = ns[fname]
+            if not callable(fn) or node.keywords or len(node.args) > 3:
+                raise ValueError("bad function call")
+            return fn(*(evaluate(a, depth + 1) for a in node.args))
+        raise ValueError(f"unsupported calc syntax: {type(node).__name__}")
+
+    return float(evaluate(tree))
+
+
+def _parse_exam_spec(text):
+    letter = expr = None
+    options = {}
+    for raw in (text or "").splitlines():
+        s = raw.strip()
+        u = s.upper()
+        if u.startswith("ANSWER:"):
+            letter = s.split(":", 1)[1].strip()
+        elif u.startswith("CALC:"):
+            expr = s.split(":", 1)[1].strip()
+        elif u.startswith("OPTIONS:"):
+            body = s.split(":", 1)[1].strip()
+            if body.lower() in ("none", "n/a", ""):
+                continue
+            # Split on ';' first. Blanking commas up front silently ate
+            # thousands separators ($1,234.50) and comma-separated lists,
+            # leaving no options at all — which drops the override.
+            parts = body.split(";") if ";" in body else body.split(",")
+            for part in parts:
+                part = part.strip()
+                if not part or "=" not in part:
+                    continue
+                k, v = part.split("=", 1)
+                k = k.strip().rstrip(".").upper()[:1]
+                v = v.strip().replace("$", "").replace(",", "")
+                try:
+                    options[k] = float(v)
+                except ValueError:
+                    pass
+    return letter, expr, options
+
+
+def _exam_answer(b64, custom_prompt=None):
+    """VLM reads the screen; Python computes. Calculator wins ties vs the letter."""
+    reply = _ask_blocking(b64, "Exam", custom_prompt)
+    letter, expr, options = _parse_exam_spec(reply)
+    if not expr or expr.lower() in ("none", "n/a", ""):
+        return letter or reply
+    try:
+        val = _safe_calc_eval(expr)
+    except Exception as e:
+        return (letter or reply) + f"\n[calc failed: {e}]"
+    if options:
+        closest = min(options, key=lambda k: abs(options[k] - val))
+        shown = options[closest]
+        return f"{closest}. {shown:g}\ncomputed {val:g}"
+    if letter:
+        return f"{letter}\ncomputed {val:g}"
+    return f"{val:g}"
 
 
 # ── Graph mode: derive the equation, plot the correct graph ───────────────────
@@ -566,7 +724,10 @@ def _auto_loop(interval, mode, gen):
                 _auto_preview = img
                 _auto_status = "Thinking..."
                 _auto_update_event.set()   # push new preview + keep old answer visible
-                new_answer = _ask_blocking(b64, mode, None)
+                if mode == "Exam":
+                    new_answer = _exam_answer(b64, None)
+                else:
+                    new_answer = _ask_blocking(b64, mode, None)
                 _auto_answer = new_answer  # only swap when ready
                 _auto_status = "Done. Watching..."
             _auto_update_event.set()
