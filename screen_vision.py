@@ -177,7 +177,7 @@ def _changed(thumb):
     return False
 
 
-def _build_request(b64, mode, custom_prompt=None, stream=True):
+def _build_request(b64, mode, custom_prompt=None, stream=True, temperature=None):
     if mode == "Business":
         system = SYSTEM_BUSINESS
         prompt = custom_prompt or PROMPT_BUSINESS
@@ -202,7 +202,8 @@ def _build_request(b64, mode, custom_prompt=None, stream=True):
             {"role": "user", "content": prompt, "images": [b64]},
         ],
         "stream": stream,
-        "options": {"num_ctx": 8192, "num_predict": num_predict, "temperature": 0.1},
+        "options": {"num_ctx": 8192, "num_predict": num_predict,
+                    "temperature": 0.1 if temperature is None else temperature},
     }).encode()
 
 
@@ -264,8 +265,8 @@ def ask(question, mode):
         yield "[" + msg + "]", None
 
 
-def _ask_blocking(b64, mode, custom_prompt=None):
-    body = _build_request(b64, mode, custom_prompt, stream=False)
+def _ask_blocking(b64, mode, custom_prompt=None, temperature=None):
+    body = _build_request(b64, mode, custom_prompt, stream=False, temperature=temperature)
     req = urllib.request.Request(
         f"{OLLAMA}/api/chat", data=body,
         headers={"Content-Type": "application/json"}, method="POST",
@@ -829,20 +830,105 @@ def _clean_why(why, chosen=None, options=None):
     return text
 
 
-def _exam_answer(b64, custom_prompt=None):
-    """VLM reads the screen; Python decides. Three routes, most reliable first:
-    compute the expression, verify options against the equation, or (opt-in)
-    look the answer up. The model's own letter is the last resort, and is
-    labelled as such."""
-    reply = _ask_blocking(b64, "Exam", custom_prompt)
+# ── Effort: trade latency for agreement ─────────────────────────────────────
+EFFORT_MODES = ["Fast", "Careful", "Deep"]
+EFFORT_SAMPLES = {"Fast": 1, "Careful": 3, "Deep": 5}
+_EFFORT = "Fast"
+
+
+def set_effort(mode):
+    global _EFFORT
+    _EFFORT = mode if mode in EFFORT_MODES else "Fast"
+    n = EFFORT_SAMPLES[_EFFORT]
+    return f"Effort: {_EFFORT} — {n} pass" + ("es" if n > 1 else "")
+
+
+def _exam_sample(b64, custom_prompt, temperature):
+    """One full read of the screen, parsed into the exam contract."""
+    reply = _ask_blocking(b64, "Exam", custom_prompt, temperature=temperature)
     letter, expr, options = _parse_exam_spec(reply)
-    eq = _line_after(reply, "EQ:")
-    why = _line_after(reply, "WHY:")
+    return {
+        "reply": reply,
+        "letter": (letter or "").strip()[:1].upper(),
+        "expr": (expr or "").strip(),
+        "eq": _line_after(reply, "EQ:").strip(),
+        "why": _line_after(reply, "WHY:").strip(),
+        "options": options,
+    }
+
+
+def _verify_sample(s):
+    """Can Python prove this sample? Returns (letter, note, chosen_value) or None."""
+    expr, eq, options = s["expr"], s["eq"], s["options"]
+    if expr and expr.lower() not in ("none", "n/a", ""):
+        try:
+            val = _safe_calc_eval(expr)
+        except Exception:
+            if options and not eq:
+                eq = expr           # the equation was written on the CALC line
+        else:
+            if options:
+                closest = min(options, key=lambda k: abs(options[k] - val))
+                return closest, f"computed {val:g}", options[closest]
+            if s["letter"]:
+                return s["letter"], f"computed {val:g}", None
+    if eq and eq.lower() not in ("none", "n/a", "") and options:
+        pick, _residual = _solve_by_substitution(eq, options)
+        if pick:
+            return pick, "verified by substitution", options[pick]
+    return None
+
+
+def _exam_answer(b64, custom_prompt=None):
+    """VLM reads the screen; Python decides. Verification first (compute, or
+    check the options against the equation), then agreement across passes, then
+    optional retrieval, and only then the model's own letter — labelled."""
+    n = EFFORT_SAMPLES.get(_EFFORT, 1)
+    samples = []
+    for i in range(n):
+        try:
+            samples.append(_exam_sample(b64, custom_prompt, 0.1 if i == 0 else 0.7))
+        except Exception:
+            if not samples:
+                raise
+            break
+
+    # Proof beats votes: a majority agreeing on a wrong letter is the exact
+    # failure the calculator exists to prevent.
+    proofs = [p for p in (_verify_sample(s) for s in samples) if p]
+    if proofs:
+        letters = [p[0] for p in proofs]
+        winner = max(set(letters), key=letters.count)
+        pick, note, chosen = next(p for p in proofs if p[0] == winner)
+        if n > 1:
+            note += f" · {letters.count(winner)}/{n} passes verified the same"
+        shown = f"{pick}. {chosen:g}" if chosen is not None else pick
+        why = next((s["why"] for s in samples if s["letter"] == pick and s["why"]),
+                   samples[0]["why"])
+        options = samples[0]["options"]
+        return (shown + "\n" + note +
+                (("\n" + _clean_why(why, chosen, options)) if _clean_why(why, chosen, options) else ""))
+
+    # Nothing provable — fall back to what the passes agree on.
+    reply = samples[0]["reply"]
+    options = samples[0]["options"]
+    votes = [s["letter"] for s in samples if s["letter"]]
+    letter = max(set(votes), key=votes.count) if votes else samples[0]["letter"]
+    why = next((s["why"] for s in samples if s["letter"] == letter and s["why"]), "")
+    eq = samples[0]["eq"]
+    vote_note = ""
+    if n > 1 and votes:
+        agree = votes.count(letter)
+        vote_note = f"{agree}/{n} passes agree"
+        if agree <= n // 2:
+            vote_note += " — weak agreement, check this one"
+    expr = samples[0]["expr"]
 
     def out(body, note="", chosen=None):
         text = body
-        if note:
-            text += "\n" + note
+        for extra in (vote_note, note):
+            if extra:
+                text += "\n" + extra
         explanation = _clean_why(why, chosen, options)
         if explanation:
             text += "\n" + explanation
@@ -850,33 +936,11 @@ def _exam_answer(b64, custom_prompt=None):
 
     calc_note = ""
     if expr and expr.lower() not in ("none", "n/a", ""):
-        try:
-            val = _safe_calc_eval(expr)
-        except Exception as e:
-            calc_note = f"[calc failed: {e}]"
-            # The model routinely writes the *equation* on the CALC line, which
-            # the arithmetic sandbox cannot evaluate ("unknown name: x"). With
-            # options on screen that is still checkable — treat it as an EQ.
-            if options and not eq:
-                eq = expr
-        else:
-            if options:
-                closest = min(options, key=lambda k: abs(options[k] - val))
-                return out(f"{closest}. {options[closest]:g}", f"computed {val:g}",
-                           options[closest])
-            if letter:
-                return out(letter, f"computed {val:g}")
-            return out(f"{val:g}")
-
-    # "Solve for x" — check each option against the equation instead of solving.
+        calc_note = "[calc failed]"
     if eq and eq.lower() not in ("none", "n/a", "") and options:
-        pick, residual = _solve_by_substitution(eq, options)
-        if pick:
-            return out(f"{pick}. {options[pick]:g}", "verified by substitution",
-                       options[pick])
-        calc_note = calc_note or ""
+        _pick, residual = _solve_by_substitution(eq, options)
         if residual is not None:
-            calc_note = calc_note or "[no option satisfies the equation]"
+            calc_note = "[no option satisfies the equation]"
 
     # Nothing was verified by Python — this is where a second opinion earns its
     # time, and the only place it is spent.
@@ -1320,6 +1384,8 @@ with gr.Blocks(title="Screen Vision", head=HEAD_JS) as demo:
             mode_radio = gr.Radio(choices=["Exam", "Business", "Graph"], value="Exam", label="Mode")
             monitor_dd = gr.Dropdown(choices=["left", "right", "primary", "all", "1", "2"],
                                      value=_MONITOR, label="Monitor (which screen to capture)")
+            effort_dd = gr.Dropdown(choices=EFFORT_MODES, value=_EFFORT,
+                                    label="Effort (passes per question — Careful ~25s, Deep ~40s)")
             research_dd = gr.Dropdown(choices=RESEARCH_MODES, value=_RESEARCH,
                                       label="Research (non-math only — adds ~10s when on)")
             crosscheck_cb = gr.Checkbox(
@@ -1361,6 +1427,7 @@ with gr.Blocks(title="Screen Vision", head=HEAD_JS) as demo:
                 gpu_load, outputs=gpu_state_box)
             btn_gpu_unload.click(gpu_unload, outputs=gpu_state_box)
             monitor_dd.change(set_monitor, inputs=monitor_dd, outputs=status)
+            effort_dd.change(set_effort, inputs=effort_dd, outputs=status)
             research_dd.change(set_research, inputs=research_dd, outputs=status)
             crosscheck_cb.change(set_crosscheck, inputs=crosscheck_cb, outputs=status)
             mode_radio.change(lambda m: gr.update(visible=(m == "Graph")),

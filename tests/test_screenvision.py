@@ -122,7 +122,7 @@ class ScreenVisionTests(unittest.TestCase):
         """Default path must stay one call — the whole point of the opt-in gate."""
         calls = []
 
-        def fake_ask(_b64, mode, _prompt=None):
+        def fake_ask(_b64, mode, _prompt=None, **_kw):
             calls.append(mode)
             return "ANSWER: B\nCALC: none\nOPTIONS: none\n"
 
@@ -137,7 +137,7 @@ class ScreenVisionTests(unittest.TestCase):
         """A computed answer is already deterministic — no second opinion."""
         checked = []
 
-        def fake_ask(_b64, _mode, _prompt=None):
+        def fake_ask(_b64, _mode, _prompt=None, **_kw):
             return ("ANSWER: C\nCALC: 10*log10(9e-3/1e-12)\n"
                     "OPTIONS: A=-2; B=10; C=229.2; D=100\n")
 
@@ -151,7 +151,7 @@ class ScreenVisionTests(unittest.TestCase):
 
     def test_cross_check_reconciles_a_disagreement(self):
         """Disagreement must end in a decision, not a shrug."""
-        def fake_ask(_b64, _mode, _prompt=None):
+        def fake_ask(_b64, _mode, _prompt=None, **_kw):
             return "ANSWER: B\nCALC: none\nEQ: none\nOPTIONS: A=1; B=2; C=3\n"
 
         def fake_model(model, system, _b64, _prompt, **_kw):
@@ -167,10 +167,44 @@ class ScreenVisionTests(unittest.TestCase):
         self.assertTrue(out.startswith("C"), out)
         self.assertIn("changed to C", out)
 
+    def test_careful_mode_votes_across_passes(self):
+        replies = iter([
+            "ANSWER: A\nCALC: none\nEQ: none\nOPTIONS: A=1; B=2; C=3\n",
+            "ANSWER: B\nCALC: none\nEQ: none\nOPTIONS: A=1; B=2; C=3\n",
+            "ANSWER: B\nCALC: none\nEQ: none\nOPTIONS: A=1; B=2; C=3\n",
+        ])
+
+        with mock.patch.object(screen_vision, "_ask_blocking",
+                               lambda *a, **k: next(replies)), \
+                mock.patch.object(screen_vision, "_EFFORT", "Careful"), \
+                mock.patch.object(screen_vision, "_RESEARCH", "Off"), \
+                mock.patch.object(screen_vision, "_CROSSCHECK", False):
+            out = screen_vision._exam_answer("fake-b64")
+        self.assertTrue(out.startswith("B"), out)
+        self.assertIn("2/3 passes agree", out)
+
+    def test_proof_outranks_a_majority_of_wrong_votes(self):
+        """Two passes voting for the wrong letter must not beat one computation."""
+        replies = iter([
+            "ANSWER: C\nCALC: none\nEQ: none\nOPTIONS: A=-2; B=10; C=229.2; D=100\n",
+            "ANSWER: C\nCALC: none\nEQ: none\nOPTIONS: A=-2; B=10; C=229.2; D=100\n",
+            "ANSWER: C\nCALC: 10*log10(9e-3/1e-12)\n"
+            "EQ: none\nOPTIONS: A=-2; B=10; C=229.2; D=100\n",
+        ])
+
+        with mock.patch.object(screen_vision, "_ask_blocking",
+                               lambda *a, **k: next(replies)), \
+                mock.patch.object(screen_vision, "_EFFORT", "Careful"), \
+                mock.patch.object(screen_vision, "_RESEARCH", "Off"), \
+                mock.patch.object(screen_vision, "_CROSSCHECK", False):
+            out = screen_vision._exam_answer("fake-b64")
+        self.assertTrue(out.startswith("D."), out)
+        self.assertIn("computed 99.5", out)
+
     def test_cross_check_agreement_is_reported_without_a_third_call(self):
         calls = []
 
-        def fake_ask(_b64, _mode, _prompt=None):
+        def fake_ask(_b64, _mode, _prompt=None, **_kw):
             return "ANSWER: B\nCALC: none\nEQ: none\nOPTIONS: A=1; B=2; C=3\n"
 
         def fake_model(_model, _system, _b64, _prompt, **_kw):
@@ -186,7 +220,7 @@ class ScreenVisionTests(unittest.TestCase):
         self.assertIn("confirmed by", out)
 
     def test_research_cites_its_source_when_evidence_supports_an_option(self):
-        def fake_ask(_b64, mode, _prompt=None):
+        def fake_ask(_b64, mode, _prompt=None, **_kw):
             if mode == "Transcribe":
                 return "Which organelle performs photosynthesis?\nA. Ribosome\nB. Chloroplast"
             return "ANSWER: A\nCALC: none\nOPTIONS: none\n"
@@ -205,7 +239,7 @@ class ScreenVisionTests(unittest.TestCase):
 
     def test_research_says_so_instead_of_failing_open(self):
         """No evidence must be announced, not silently swapped for a guess."""
-        def fake_ask(_b64, mode, _prompt=None):
+        def fake_ask(_b64, mode, _prompt=None, **_kw):
             if mode == "Transcribe":
                 return "Some question?\nA. one\nB. two"
             return "ANSWER: A\nCALC: none\nOPTIONS: none\n"
