@@ -6,6 +6,11 @@ __pycache__/
 venv/
 env/
 
+# Secrets — SCREENVISION_TOKEN and friends belong in the environment, never here
+.env
+*.env
+!*.env.example
+
 # Runtime / local
 *.log
 *.bak
