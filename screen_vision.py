@@ -843,6 +843,39 @@ def set_effort(mode):
     return f"Effort: {_EFFORT} — {n} pass" + ("es" if n > 1 else "")
 
 
+def _why_letter(text):
+    """The model often names the option in its own explanation ("matching option
+    D"). When that disagrees with the letter the numeric match produced, the
+    OPTIONS line was almost certainly invented — seen live on a worded
+    discriminant question where it emitted A=0 and we "verified" A while its
+    explanation said D."""
+    import re as _re
+    m = _re.search(r"option\s+([A-Z])\b", text or "", _re.I)
+    return m.group(1).upper() if m else ""
+
+
+SYSTEM_MAP = (
+    "A calculation has already been done and its result is given to you as "
+    "fact. Do NOT recompute it and do NOT contradict it. Decide which option on "
+    "screen follows from that result.\n"
+    "Reply with exactly two lines:\n"
+    "ANSWER: <letter>\n"
+    "WHY: <one sentence, 20 words maximum>"
+)
+
+
+def _map_computed_to_option(b64, val, expr):
+    """Python owns the arithmetic; the model only maps the number onto the
+    wording of the options (e.g. discriminant 0 -> "one rational double root")."""
+    prompt = (f"The computation {expr} = {val:g} is correct and final. "
+              f"Which option on screen follows from it?")
+    try:
+        reply = _ask_model(MODEL, SYSTEM_MAP, b64, prompt, num_predict=90)
+    except Exception:
+        return "", ""
+    return _first_letter(_line_after(reply, "ANSWER:")), _line_after(reply, "WHY:").strip()
+
+
 def _exam_sample(b64, custom_prompt, temperature):
     """One full read of the screen, parsed into the exam contract."""
     reply = _ask_blocking(b64, "Exam", custom_prompt, temperature=temperature)
@@ -854,6 +887,7 @@ def _exam_sample(b64, custom_prompt, temperature):
         "eq": _line_after(reply, "EQ:").strip(),
         "why": _line_after(reply, "WHY:").strip(),
         "options": options,
+        "computed": None,
     }
 
 
@@ -870,8 +904,10 @@ def _verify_sample(s):
             if options:
                 closest = min(options, key=lambda k: abs(options[k] - val))
                 return closest, f"computed {val:g}", options[closest]
-            if s["letter"]:
-                return s["letter"], f"computed {val:g}", None
+            # A number with no numeric option to match against proves nothing
+            # about the letter. Keep the value; let the mapping pass use it.
+            s["computed"] = (val, expr)
+            return None
     if eq and eq.lower() not in ("none", "n/a", "") and options:
         pick, _residual = _solve_by_substitution(eq, options)
         if pick:
@@ -896,6 +932,19 @@ def _exam_answer(b64, custom_prompt=None):
     # Proof beats votes: a majority agreeing on a wrong letter is the exact
     # failure the calculator exists to prevent.
     proofs = [p for p in (_verify_sample(s) for s in samples) if p]
+    # If the model's own explanation names a different option than the numeric
+    # match, the OPTIONS line was invented — do not treat the match as proof.
+    if proofs:
+        named = _why_letter(samples[0]["why"])
+        if named and named != proofs[0][0]:
+            for s in samples:
+                if s["expr"]:
+                    try:
+                        s["computed"] = (_safe_calc_eval(s["expr"]), s["expr"])
+                    except Exception:
+                        pass
+                    break
+            proofs = []
     if proofs:
         letters = [p[0] for p in proofs]
         winner = max(set(letters), key=letters.count)
@@ -908,6 +957,19 @@ def _exam_answer(b64, custom_prompt=None):
         options = samples[0]["options"]
         return (shown + "\n" + note +
                 (("\n" + _clean_why(why, chosen, options)) if _clean_why(why, chosen, options) else ""))
+
+    # Computed a number but the options are worded, not numeric — let the model
+    # do the one job it is reliable at: matching that number to the wording.
+    for s in samples:
+        if s.get("computed"):
+            val, expr = s["computed"]
+            pick, mapped_why = _map_computed_to_option(b64, val, expr)
+            if pick:
+                text = f"{pick}\ncomputed {expr} = {val:g}"
+                if mapped_why:
+                    text += "\n" + mapped_why
+                return text
+            break
 
     # Nothing provable — fall back to what the passes agree on.
     reply = samples[0]["reply"]
@@ -936,7 +998,7 @@ def _exam_answer(b64, custom_prompt=None):
 
     calc_note = ""
     if expr and expr.lower() not in ("none", "n/a", ""):
-        calc_note = "[calc failed]"
+        calc_note = "[not verified by calculation]"
     if eq and eq.lower() not in ("none", "n/a", "") and options:
         _pick, residual = _solve_by_substitution(eq, options)
         if residual is not None:
